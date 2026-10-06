@@ -1,0 +1,6 @@
+# Allowlist: only the current pipeline is tracked. Old manual copies (step6.1-6.4, "- 31.08"),
+# earlier-step scripts and data files (csv/xlsx) stay local. To track a new file, add a "!" line.
+*
+!.gitignore
+!presentation_summary_step6.py
+!inspect_followup_columns.py
