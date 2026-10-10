@@ -64,7 +64,7 @@ warnings.filterwarnings("ignore")
 #      cohort composition alone.
 #   3. The general/reference population is measured via CONTINUOUS DYNAMIC-EXPOSURE LEXIS
 #      TRACKING (compute_general_lexis_split()), not a fixed window from an anchor point: every
-#      patient is tracked as "general" from max(REGISTRY_START, fu_start) until they get exposed
+#      patient is tracked as "general" from REGISTRY_START until they get exposed
 #      (raw exposure date, any diagnoser), get the downstream outcome, or fu_end --
 #      whichever comes first -- and that continuous interval is split across whatever calendar
 #      periods a given chart needs (a single whole-period total for H2/heatmaps/B1, or
@@ -83,11 +83,10 @@ warnings.filterwarnings("ignore")
 #      as a "hit" if it falls within LAG_DAYS of entry (protopathic-bias / same-episode
 #      relabeling concern) -- not enabled by default; Statement 6's latency histograms are the
 #      empirical basis for deciding whether a specific value is warranted.
-#   7. Person-time only counts while the patient was actually under Clalit follow-up --
-#      [fu_start, fu_end] = current continuous membership, from age 15 and from immigration,
-#      until leaving Clalit / death / STUDY_END. Exposures outside that window aren't entries,
-#      and prevalent cases (outcome already on/before the at-risk start) are excluded. See
-#      FOLLOW-UP WINDOW below.
+#   7. Person-time stops at fu_end = membership end (left Clalit / death) or STUDY_END.
+#      Exposed follow-up runs from the exposure date to the earliest of downstream diagnosis,
+#      entry + FIXED_WINDOW_DAYS, fu_end. Prevalent cases (outcome already on/before the
+#      at-risk start) are excluded. See FOLLOW-UP END below.
 # This means Statement 1 page 1 and Statement 2 page 1 do NOT reproduce the original H2/B1
 # images' raw numbers anymore (those used unrestricted, any-time-ever, patient-count-based
 # follow-up) -- that divergence is intentional, per explicit instruction, not a bug.
@@ -328,33 +327,22 @@ REGISTRY_START = pd.Timestamp("2017-01-01")   # earliest point with data -- star
                                               # general-population tracking (see PERSON-TIME
                                               # CORE below). Replaces the old 5-anchor design.
 
-# --- FOLLOW-UP WINDOW: when each patient was actually under Clalit's medical monitoring -------
-# A diagnosis can only be recorded while a patient is an active member, so person-time outside
-# membership is time in which an event is invisible -- counting it inflates the denominator.
-# Before this, every patient was counted as at risk from REGISTRY_START to STUDY_END, which
-# inflated the EARLY years most (10% of the cohort joined after 2017, ~17% turned 15/18 after
-# 2017) and kept counting people who left Clalit or died (~9%) until STUDY_END.
+# --- FOLLOW-UP END: person-time stops when the patient leaves Clalit -------------------------
+# A diagnosis can only be recorded while a patient is an active member, so after membership ends
+# we don't know what happened -- counting that time would inflate the denominator.
 # Per patient (built in build_frame()):
-#   fu_start = latest of (start of the CURRENT continuous membership, immigration date, 15th birthday)
-#   fu_end   = earliest of (end of that membership, STUDY_END)
-# The "cohort reference event-membership" columns are used, NOT "clalit membership": the clalit
-# ones describe the FIRST membership episode ever (22% of patients left and re-joined, and for
-# them clalit_start..clalit_end is an old episode followed by a gap). The cohort columns are the
-# continuous episode the patient is in now. End date 2079-06-06 = still a member (placeholder,
-# capped at STUDY_END).
-# Rules that follow from this, applied to EVERY person-time calculation below:
-#   - EXPOSED: an exposure only counts as an entry if diagnosed inside [fu_start, fu_end]
-#     (enforced in first_of()). A first-ever exposure before fu_start (before age 15, before
-#     immigration, or during an earlier membership episode) means the patient is in neither
-#     group -- not exposed (we can't follow them from diagnosis) and not general (they were
-#     exposed). Follow-up after entry also ends at fu_end (left Clalit / died).
-#   - GENERAL: tracked from max(REGISTRY_START, fu_start) instead of REGISTRY_START for everyone.
+#   fu_end = earliest of ("cohort reference event-membership end date", STUDY_END)
+#            (2079-06-06 = still a member, capped at STUDY_END; missing -> STUDY_END)
+#   fu_start = REGISTRY_START for everyone -- only the END of follow-up comes from membership.
+# Rules, applied to EVERY person-time calculation below:
+#   - EXPOSED: at risk from the exposure (PTSD/ASR) date until the EARLIEST of -- the downstream
+#     diagnosis, entry + FIXED_WINDOW_DAYS, fu_end. Every exposed patient is an entry, whatever
+#     their membership start, age or immigration date.
+#   - GENERAL: tracked from REGISTRY_START until the earliest of exposure / downstream / fu_end.
 #   - PREVALENT CASES: a patient whose first-ever outcome is dated on/before the start of their
-#     at-risk time (entry for exposed, start of general tracking for general) is not at risk of
-#     a FIRST-ever outcome and contributes no person-time for that outcome.
-MEMBERSHIP_START_COL = "cohort reference event-membership start date"
+#     at-risk time (entry for exposed, REGISTRY_START for general) is not at risk of a FIRST-ever
+#     outcome and contributes no person-time for that outcome.
 MEMBERSHIP_END_COL   = "cohort reference event-membership end date"
-FOLLOWUP_MIN_AGE     = 15
 _followup_end = None   # per-patient fu_end Series (full-population index), set by set_followup()
 
 
@@ -445,10 +433,10 @@ def person_time_rate(entry_dates, event_dates, window_days=None, lag_days=LAG_DA
 # period it's meant to represent -- it bleeds into the following year(s), so "the general rate
 # for 2023" computed that way was never really just 2023. The correct fix is to drop the
 # window/anchor concept for the general side altogether: every patient is tracked CONTINUOUSLY
-# as "general" (never yet exposed to `exposure_outcomes`) from max(REGISTRY_START, fu_start)
+# as "general" (never yet exposed to `exposure_outcomes`) from REGISTRY_START
 # until the EARLIEST of -- they get exposed (raw exposure date, regardless of diagnoser mode --
 # see note below), they get `downstream_outcome`, or fu_end (left Clalit / died / STUDY_END --
-# see FOLLOW-UP WINDOW above). That continuous interval is then split
+# see FOLLOW-UP END above). That continuous interval is then split
 # across whatever calendar periods the caller asks for (whole years, split-2023 years,
 # quarters, ...) via ordinary Lexis splitting, giving a genuine period-specific rate with no
 # anchor choice involved at all.
@@ -464,7 +452,7 @@ def compute_general_lexis_split(frame, exposure_outcomes, downstream_outcome, pe
     exposure_date = first_of_raw(frame, exposure_outcomes)
     down = frame[f"first_{downstream_outcome}"]
 
-    # per-patient tracking window: from max(REGISTRY_START, fu_start) to the earliest of
+    # per-patient tracking window: from REGISTRY_START (fu_start) to the earliest of
     # exposure / fu_end (fu_end is already capped at STUDY_END)
     gen_start = frame["fu_start"].clip(lower=REGISTRY_START)
     fu_end = frame["fu_end"]
@@ -571,8 +559,8 @@ BASE_COLS = ["patient id", "birth date", "gender",
              "demographics_2023-district", "country of birth", "immigration date",
              "mailing language", "demographics_2023-insurance type",
              "charlson - lastuntil2023-charlson score total",
-             # --- follow-up (membership) window -- see FOLLOW-UP WINDOW below ---
-             MEMBERSHIP_START_COL, MEMBERSHIP_END_COL]
+             # --- follow-up (membership) window -- see FOLLOW-UP END below ---
+             MEMBERSHIP_END_COL]
 # Period-level columns needed for the Statement-1 supporting tests (2b uses the collapsed
 # "_start date" cols already in BASE; 5/9 need entry meta, 6 needs the downstream
 # diagnosis_vector) PLUS Statement 5, which needs "profession" for every outcome and
@@ -653,19 +641,15 @@ def build_frame(df):
     frame["charlson_score"]  = pd.to_numeric(
         df.get("charlson - lastuntil2023-charlson score total", pd.Series(index=df.index)), errors="coerce").values
 
-    # --- Follow-up window (see FOLLOW-UP WINDOW near the top of the file) ---
-    if MEMBERSHIP_START_COL in df.columns:
-        membership_start = pd.to_datetime(df[MEMBERSHIP_START_COL], errors="coerce")
-        membership_end   = pd.to_datetime(df[MEMBERSHIP_END_COL], errors="coerce")
+    # --- Follow-up window (see FOLLOW-UP END near the top of the file) ---
+    if MEMBERSHIP_END_COL in df.columns:
+        membership_end = pd.to_datetime(df[MEMBERSHIP_END_COL], errors="coerce")
     else:
-        print(f"WARNING: '{MEMBERSHIP_START_COL}' not found -- follow-up falls back to "
-              f"REGISTRY_START..STUDY_END for everyone (membership NOT taken into account)")
-        membership_start = pd.Series(REGISTRY_START, index=df.index)
-        membership_end   = pd.Series(STUDY_END, index=df.index)
-    min_age_date = birth + pd.DateOffset(years=FOLLOWUP_MIN_AGE)
-    frame["fu_start"] = pd.concat([membership_start, frame["immigration_date"], min_age_date],
-                                  axis=1).max(axis=1).values   # NaT immigration/birth are skipped
-    frame["fu_start"] = frame["fu_start"].where(membership_start.notna().values)   # no membership -> no follow-up
+        print(f"WARNING: '{MEMBERSHIP_END_COL}' not found -- follow-up runs to STUDY_END for "
+              f"everyone (membership end NOT taken into account)")
+        membership_end = pd.Series(STUDY_END, index=df.index)
+    # only the END of follow-up comes from membership -- start is REGISTRY_START for everyone
+    frame["fu_start"] = REGISTRY_START
     frame["fu_end"] = membership_end.fillna(STUDY_END).clip(upper=STUDY_END).values   # 2079-06-06 = active
 
     for outcome in ALL_OUTCOMES:
@@ -800,8 +784,6 @@ def _diagnoser_match_mask(frame, outcome_list, raw_dates):
 # ~diagnoser_excluded_mask(...) for exactly this reason.
 def first_of(frame, outcome_list):
     raw_dates = first_of_raw(frame, outcome_list)
-    # only an exposure diagnosed while under follow-up counts as an entry (FOLLOW-UP WINDOW above)
-    raw_dates = raw_dates.where((raw_dates >= frame["fu_start"]) & (raw_dates <= frame["fu_end"]))
     if CURRENT_DIAGNOSER_MODE == "any_diagnoser":
         return raw_dates
     keep = _diagnoser_match_mask(frame, outcome_list, raw_dates)
@@ -2962,21 +2944,13 @@ def _run_sanity_checks_body(frame_full, entry_meta_full, downstream_meta_full, o
     missing = [c for c in expected_cols if c not in frame.columns]
     check("all expected derived columns present on the loaded frame", not missing, f"missing={missing}")
 
-    # --- 1b. Follow-up window (membership / age 15 / immigration) ---
-    no_fu = frame["fu_start"].isna() | (frame["fu_end"] <= frame["fu_start"])
-    info("patients with NO follow-up time at all (no membership, or window empty)",
-         f"{int(no_fu.sum()):,} ({no_fu.mean():.1%})")
-    info("fu_start after REGISTRY_START (joined / turned 15 / immigrated after 2017)",
-         f"{int((frame['fu_start'] > REGISTRY_START).sum()):,}")
+    # --- 1b. Follow-up end (membership end) ---
     info("fu_end before STUDY_END (left Clalit or died)",
          f"{int((frame['fu_end'] < STUDY_END).sum()):,}")
     check("fu_end never later than STUDY_END", bool((frame["fu_end"] <= STUDY_END).all()))
     entry = first_of(frame, TRAUMA_EXPOSURE_OUTCOMES).dropna()
-    in_window = (entry >= frame.loc[entry.index, "fu_start"]) & (entry <= frame.loc[entry.index, "fu_end"])
-    check("every exposed entry date lies inside its patient's follow-up window", bool(in_window.all()))
-    raw = first_of_raw(frame, TRAUMA_EXPOSURE_OUTCOMES)
-    info(f"{TRAUMA_EXPOSURE_LABEL} patients dropped because first diagnosis was outside follow-up",
-         f"{int(raw.notna().sum() - len(entry)):,} of {int(raw.notna().sum()):,}")
+    info(f"{TRAUMA_EXPOSURE_LABEL} patients diagnosed AFTER membership end (contribute 0 days)",
+         f"{int((entry > frame.loc[entry.index, 'fu_end']).sum()):,} of {len(entry):,}")
 
     # --- 2. zone_populations sums to len(frame), for every age band (exhaustive/mutually
     # exclusive zone assignment -- nobody should be silently dropped) ---
