@@ -3062,6 +3062,470 @@ def load_and_build(input_file):
     return built
 
 
+# =============================================================================
+# DESCRIPTIVE COMPANION PDF -- written next to every presentation_summary_*.pdf as
+# presentation_summary_*_descriptive.pdf. No statistical tests: counts, person-years, follow-up,
+# distributions -- the raw material behind each slide, so every slide's numbers can be read in
+# context. Every page names the slide(s) it explains (numbering = the slide guide document).
+# =============================================================================
+FOLLOWUP_END_REASONS = ["2nd diagnosis (event)", "window ended", "left Clalit (membership end)",
+                        "study end (30.6.2026)"]
+FOLLOWUP_END_COLORS = ["#e63946", "#95a5a6", "#457b9d", "#f4a261"]
+
+
+def fmt_cell(v):
+    if isinstance(v, str):
+        return v
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "-"
+    if isinstance(v, (int, np.integer)) or float(v).is_integer():
+        return f"{int(v):,}"
+    return f"{v:,.1f}"
+
+
+def draw_table_page(pdf, title, df, note=None, font_size=8):
+    """One PDF page holding `df` as a table (index becomes the first column)."""
+    table_df = df.reset_index()
+    n_rows = len(table_df)
+    fig, ax = plt.subplots(figsize=(14, 0.6 + 0.3 * (n_rows + 1)))
+    ax.axis("off")
+    tbl = ax.table(cellText=[[fmt_cell(v) for v in row] for row in table_df.itertuples(index=False)],
+                   colLabels=[str(c) for c in table_df.columns], loc="upper center", cellLoc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(font_size)
+    tbl.auto_set_column_width(col=list(range(len(table_df.columns))))
+    tbl.scale(1, 1.35)
+    for (r, c), cell in tbl.get_celld().items():
+        if r == 0:
+            cell.set_facecolor("#e9ecef"); cell.set_text_props(fontweight="bold")
+        if c == 0 and r > 0:
+            cell.set_text_props(ha="left", fontweight="bold")
+    ax.set_title(title, fontsize=10, fontweight="bold", loc="left")
+    if note:
+        ax.text(0, -0.04, note, transform=ax.transAxes, fontsize=7.5, ha="left", va="top", wrap=True)
+    pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+
+def exposed_followup_detail(entry_dates, event_dates, window_days=None):
+    """Per at-risk exposed patient (prevalent cases removed): entry, end, months followed, whether
+    the follow-up ended in an event, and why it ended. Same rules as person_time_events_and_years().
+    Returns (DataFrame, n_prevalent)."""
+    window_days = FIXED_WINDOW_DAYS if window_days is None else window_days
+    entry = entry_dates.dropna()
+    event = event_dates.reindex(entry.index)
+    prevalent = event.notna() & (event <= entry)
+    entry, event = entry[~prevalent], event[~prevalent]
+
+    window_end = entry + pd.to_timedelta(window_days, unit="D")
+    fu_end = followup_end_for(entry.index)
+    boundary = pd.concat([window_end, pd.Series(STUDY_END, index=entry.index), fu_end], axis=1).min(axis=1)
+    is_event = event.notna() & (event > entry) & (event <= boundary)
+    if LAG_DAYS > 0:
+        is_event &= (event - entry).dt.days >= LAG_DAYS
+    end = boundary.where(~is_event, event)
+
+    reason = np.select(
+        [is_event, boundary == window_end, (boundary == fu_end) & (fu_end < STUDY_END)],
+        FOLLOWUP_END_REASONS[:3], default=FOLLOWUP_END_REASONS[3])
+    detail = pd.DataFrame({"entry": entry, "end": end, "event": is_event, "reason": reason,
+                           "months": (end - entry).dt.days / 30.44})
+    return detail, int(prevalent.sum())
+
+
+def trauma_component_of_entry(frame, entry):
+    """Which trauma diagnosis opened the entry (e.g. 'PTSD' / 'ASR' / 'both same day')."""
+    comps = [o for o in TRAUMA_EXPOSURE_OUTCOMES if f"first_{o}" in frame.columns]
+    hits = pd.DataFrame({o: frame.loc[entry.index, f"first_{o}"] == entry for o in comps})
+    label = pd.Series("other", index=entry.index, dtype=object)
+    for o in comps:
+        label[hits[o]] = o.upper()
+    if len(comps) > 1:
+        label[hits.sum(axis=1) > 1] = "both same day"
+    return label
+
+
+def desc_overview_page(pdf, frame, age_label):
+    entry = first_of(frame, TRAUMA_EXPOSURE_OUTCOMES)
+    exposed = entry.notna()
+    general = first_of_raw(frame, TRAUMA_EXPOSURE_OUTCOMES).isna()
+    pre, post = exposed & (entry < OCT7), exposed & (entry >= OCT7)
+    left_early = frame["fu_end"] < STUDY_END
+    female = frame["gender"].astype(str).str.lower().str.startswith(("f", "נ"))
+    rows = {}
+    for name, mask in [("All patients in age band", pd.Series(True, index=frame.index)),
+                       (f"Exposed: {TRAUMA_EXPOSURE_LABEL} (any time)", exposed),
+                       (f"  {TRAUMA_EXPOSURE_LABEL} before Oct 7", pre),
+                       (f"  {TRAUMA_EXPOSURE_LABEL} on/after Oct 7", post),
+                       (f"General (never {TRAUMA_EXPOSURE_LABEL})", general)]:
+        sub = frame[mask]
+        rows[name] = {"n patients": int(mask.sum()),
+                      "% of age band": mask.mean() * 100,
+                      "median age at Oct 7": sub["age_at_oct7"].median(),
+                      "% female": female[mask].mean() * 100 if mask.any() else np.nan,
+                      "% left Clalit before 30.6.2026": left_early[mask].mean() * 100 if mask.any() else np.nan}
+    df = pd.DataFrame(rows).T
+    df.index.name = "Group"
+    draw_table_page(pdf, f"DESCRIPTIVE | Overview (all slides) | who is in this file | {age_label}", df,
+                    note=f"Age = age on Oct 7 2023. Exposure = earliest {TRAUMA_EXPOSURE_LABEL} diagnosis "
+                         f"({CURRENT_DIAGNOSER_LABEL}). Data from {REGISTRY_START:%d.%m.%Y} to "
+                         f"{STUDY_END:%d.%m.%Y}. '% female' assumes the gender column starts with F/נ for "
+                         f"women -- check against the real coding.")
+
+    # which trauma diagnosis opened the entry, pre vs post
+    comp = trauma_component_of_entry(frame, entry[exposed])
+    side = np.where(entry[exposed] < OCT7, "before Oct 7", "on/after Oct 7")
+    mix = pd.crosstab(comp, side)
+    mix_pct = mix / mix.sum() * 100
+    mix_df = pd.concat({"n": mix, "% of column": mix_pct}, axis=1)
+    mix_df.columns = [f"{a}: {b}" for a, b in mix_df.columns]
+    mix_df.index.name = "First trauma diagnosis"
+    draw_table_page(pdf, f"DESCRIPTIVE | Overview | which trauma diagnosis opened the entry, "
+                         f"before vs after Oct 7 | {age_label}", mix_df,
+                    note="A shift toward ASR after Oct 7 means the post-war exposed group is made of "
+                         "more acute, often transient diagnoses -- relevant to every pre/post comparison.")
+
+
+def desc_statement1_pages(pdf, frame, age_label):
+    entry = first_of(frame, TRAUMA_EXPOSURE_OUTCOMES)
+    win = FIXED_WINDOW_DAYS // 30
+    rows, prepost_rows = {}, {}
+    for o in S1_DOWNSTREAM:
+        down = frame[f"first_{o}"]
+        det, n_prev = exposed_followup_detail(entry, down)
+        g_rate, g_ev, g_py = compute_general_rate_overall(frame, TRAUMA_EXPOSURE_OUTCOMES, o)
+        py = det["months"].sum() * 30.44 / 365.25
+        rows[o.upper()] = {"exposed (any)": int(entry.notna().sum()), "prior cases excluded": n_prev,
+                           "n at risk": len(det), "events": int(det["event"].sum()),
+                           "person-years": py, "rate /1,000 PY": det["event"].sum() / py * 1000 if py else np.nan,
+                           "median months followed": det["months"].median(),
+                           "general events": int(g_ev), "general PY": g_py, "general rate": g_rate}
+        r = {}
+        for side_name, side_mask in [("pre", det["entry"] < OCT7), ("post", det["entry"] >= OCT7)]:
+            sub = det[side_mask]
+            spy = sub["months"].sum() * 30.44 / 365.25
+            r[f"{side_name}: at risk"] = len(sub)
+            r[f"{side_name}: events"] = int(sub["event"].sum())
+            r[f"{side_name}: PY"] = spy
+            r[f"{side_name}: rate"] = sub["event"].sum() / spy * 1000 if spy else np.nan
+            r[f"{side_name}: median months"] = sub["months"].median()
+        prepost_rows[o.upper()] = r
+    df = pd.DataFrame(rows).T; df.index.name = "Outcome"
+    draw_table_page(pdf, f"DESCRIPTIVE | Slide 1 (H2) | numbers behind each bar, within {win}mo | {age_label}",
+                    df, font_size=7.5,
+                    note="rate = events / person-years x 1,000; IRR on slide 1 = rate / general rate. "
+                         "'prior cases excluded' = already had that outcome on/before the trauma date. "
+                         "General PY = person-years of never-exposed time since 2017 (no window).")
+    df2 = pd.DataFrame(prepost_rows).T; df2.index.name = "Outcome"
+    draw_table_page(pdf, f"DESCRIPTIVE | Slides 2-3 (+4) | before vs after Oct 7, numbers behind each "
+                         f"cell | {age_label}", df2, font_size=7.5,
+                    note="Both sides are divided by the SAME general rate on slides 2-3 (see slide 1 table). "
+                         "Slide 4 (TEST 2b) = post rate / pre rate from these two columns directly.")
+
+    # why did follow-up end -- pre vs post, per focus outcome
+    fig, axes = plt.subplots(1, 2, figsize=(13, 6))
+    fig.suptitle(f"DESCRIPTIVE | Slides 1-4, 17-19 | why each exposed patient's follow-up ended "
+                 f"(within {win}mo) | {age_label}", fontsize=11, fontweight="bold")
+    for ax, o in zip(axes, FOCUS_OUTCOMES):
+        det, _ = exposed_followup_detail(entry, frame[f"first_{o}"])
+        sides = [("before Oct 7", det[det["entry"] < OCT7]), ("on/after Oct 7", det[det["entry"] >= OCT7])]
+        bottom = np.zeros(len(sides))
+        for reason, color in zip(FOLLOWUP_END_REASONS, FOLLOWUP_END_COLORS):
+            vals = np.array([(s["reason"] == reason).mean() * 100 if len(s) else 0 for _, s in sides])
+            ax.bar(range(len(sides)), vals, bottom=bottom, color=color, label=reason, width=0.55)
+            for xi, (v, b) in enumerate(zip(vals, bottom)):
+                if v >= 3:
+                    ax.text(xi, b + v / 2, f"{v:.0f}%", ha="center", va="center", fontsize=8)
+            bottom += vals
+        ax.set_xticks(range(len(sides)))
+        ax.set_xticklabels([f"{n}\n(n at risk={len(s):,})" for n, s in sides], fontsize=8)
+        ax.set_ylabel("% of at-risk exposed patients", fontsize=8)
+        ax.set_ylim(0, 100)
+        ax.set_title(o.upper(), fontsize=10, fontweight="bold")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=4, fontsize=8, bbox_to_anchor=(0.5, -0.04))
+    plt.tight_layout(); pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+    # how long were they followed -- pre vs post
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+    fig.suptitle(f"DESCRIPTIVE | Slides 1-4, 16-19 | months of follow-up per exposed patient "
+                 f"(max {win}) | {age_label}", fontsize=11, fontweight="bold")
+    bins = np.arange(0, win + 1.01, 1)
+    for ax, o in zip(axes, FOCUS_OUTCOMES):
+        det, _ = exposed_followup_detail(entry, frame[f"first_{o}"])
+        for name, sub, color in [("before Oct 7", det[det["entry"] < OCT7], "#95a5a6"),
+                                 ("on/after Oct 7", det[det["entry"] >= OCT7], "#e63946")]:
+            if len(sub):
+                ax.hist(sub["months"], bins=bins, alpha=0.55, color=color,
+                        weights=np.full(len(sub), 100 / len(sub)),
+                        label=f"{name} (n={len(sub):,}, median {sub['months'].median():.1f}mo)")
+        ax.set_xlabel("Months followed", fontsize=8)
+        ax.set_ylabel("% of group", fontsize=8)
+        ax.set_title(o.upper(), fontsize=10, fontweight="bold")
+        ax.legend(fontsize=7)
+    plt.tight_layout(); pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+    # monthly new trauma entries, by which diagnosis opened them
+    exposed_entry = entry.dropna()
+    comp = trauma_component_of_entry(frame, exposed_entry)
+    monthly = pd.crosstab(exposed_entry.dt.to_period("M"), comp)
+    monthly = monthly.reindex(pd.period_range("2017-01", STUDY_END.strftime("%Y-%m"), freq="M"), fill_value=0)
+    fig, ax = plt.subplots(figsize=(14, 5.5))
+    x = np.arange(len(monthly))
+    bottom = np.zeros(len(monthly))
+    for i, col in enumerate(monthly.columns):
+        ax.bar(x, monthly[col].values, bottom=bottom, width=1.0, label=col,
+               color=["#e63946", "#457b9d", "#f4a261", "#95a5a6"][i % 4])
+        bottom += monthly[col].values
+    oct7_x = list(monthly.index).index(pd.Period("2023-10", freq="M"))
+    ax.axvline(oct7_x, color="black", linestyle="--", linewidth=1.2)
+    year_ticks = [i for i, p in enumerate(monthly.index) if p.month == 1]
+    ax.set_xticks(year_ticks); ax.set_xticklabels([str(monthly.index[i].year) for i in year_ticks], fontsize=8)
+    ax.set_ylabel("New exposed patients per month", fontsize=8)
+    ax.set_title(f"DESCRIPTIVE | Slides 2-3, 9, 20-21 | new {TRAUMA_EXPOSURE_LABEL} entries per month "
+                 f"(first-ever diagnosis) | {age_label}", fontsize=10, fontweight="bold", loc="left")
+    ax.legend(fontsize=8)
+    plt.tight_layout(); pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+
+def desc_old_method_tests_page(pdf, frame, entry_meta, age_label):
+    """Slides 5-8 use the older full-window design -- show who that design keeps and the base mix
+    (all eligible exposed, not just converters) of profession / setting / zone, pre vs post."""
+    entry = first_of(frame, TRAUMA_EXPOSURE_OUTCOMES)
+    eligible = entry.notna() & eligible_reachable_mask(entry)
+    last_entry = STUDY_END - pd.to_timedelta(FIXED_WINDOW_DAYS, unit="D")
+    rows = {}
+    for side_name, side_mask in [("before Oct 7", entry < OCT7), ("on/after Oct 7", entry >= OCT7)]:
+        r = {"exposed": int((entry.notna() & side_mask).sum()),
+             "kept (full window by 30.6.2026)": int((eligible & side_mask).sum())}
+        for o in FOCUS_OUTCOMES:
+            conv = eligible & side_mask & converted_within_window(entry, frame[f"first_{o}"])
+            r[f"converters: {o}"] = int(conv.sum())
+        rows[side_name] = r
+    df = pd.DataFrame(rows).T; df.index.name = "Trauma diagnosed"
+    draw_table_page(pdf, f"DESCRIPTIVE | Slides 5-8 | sample sizes under the full-window design | {age_label}",
+                    df, note=f"Slides 5-8 keep only patients diagnosed by {last_entry:%d.%m.%Y} (full "
+                             f"{FIXED_WINDOW_DAYS//30}-month window before study end), count a share of "
+                             f"patients (not person-years), and do not stop at membership end.")
+
+    profession = normalize_profession_code(
+        get_exposure_meta_field(entry_meta, TRAUMA_EXPOSURE_OUTCOMES, "profession"))
+    prof_label = profession.map(lambda c: "missing / 999" if pd.isna(c) or c in MISSING_PROFESSION_CODES
+                                else profession_code_label(c))
+    heavy = classify_trauma_engagement(entry_meta).fillna(False).map(
+        {True: "hospital setting", False: "other setting"})
+    side = pd.Series(np.where(entry < OCT7, "before Oct 7", "on/after Oct 7"), index=frame.index)
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 6.5))
+    fig.suptitle(f"DESCRIPTIVE | Slides 5, 7, 8 | base mix of ALL kept exposed patients (not only "
+                 f"converters), before vs after Oct 7 | {age_label}", fontsize=11, fontweight="bold")
+    for ax, (title, series) in zip(axes, [("Profession of trauma diagnoser (slide 5)", prof_label),
+                                          ("Setting of trauma diagnosis (slide 7)", heavy),
+                                          ("Zone of residence (slide 8)", frame["zone"])]):
+        tab = pd.crosstab(series[eligible], side[eligible])
+        if title.startswith("Profession"):
+            top = tab.sum(axis=1).sort_values(ascending=False).index[:6]
+            other = tab.drop(index=top).sum()
+            tab = tab.loc[top]
+            if other.sum() > 0:
+                tab.loc["other"] = other
+        pct = tab / tab.sum() * 100
+        bottom = np.zeros(pct.shape[1])
+        for i, cat in enumerate(pct.index):
+            ax.bar(range(pct.shape[1]), pct.loc[cat].values, bottom=bottom, label=str(cat)[:28],
+                   color=plt.cm.tab10(i % 10), width=0.55)
+            bottom += pct.loc[cat].values
+        ax.set_xticks(range(pct.shape[1]))
+        ax.set_xticklabels([f"{c}\n(n={int(tab[c].sum()):,})" for c in pct.columns], fontsize=8)
+        ax.set_ylim(0, 100); ax.set_ylabel("% of kept exposed patients", fontsize=8)
+        ax.set_title(title, fontsize=9, fontweight="bold")
+        ax.legend(fontsize=6.5, loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=2)
+    plt.tight_layout(); pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+
+def desc_yearly_pages(pdf, frame, age_label):
+    entry = first_of(frame, TRAUMA_EXPOSURE_OUTCOMES)
+    for o in FOCUS_OUTCOMES:
+        down = frame[f"first_{o}"]
+        gen = compute_general_lexis_split(frame, TRAUMA_EXPOSURE_OUTCOMES, o, YEARLY_TREND_PERIODS)
+        rows = {}
+        for label, start, end in YEARLY_TREND_PERIODS:
+            period_entry = entry.where((entry >= start) & (entry < end))
+            det, n_prev = exposed_followup_detail(period_entry, down)
+            py = det["months"].sum() * 30.44 / 365.25
+            rows[label.replace("\n", " ")] = {
+                "new exposed": int(period_entry.notna().sum()), "prior cases excl.": n_prev,
+                "at risk": len(det), "events": int(det["event"].sum()), "PY": py,
+                "rate": det["event"].sum() / py * 1000 if py else np.nan,
+                "general events": int(gen.loc[label, "n_events"]), "general PY": gen.loc[label, "person_years"],
+                "general rate": gen.loc[label, "rate"]}
+        df = pd.DataFrame(rows).T; df.index.name = "Year of trauma dx"
+        draw_table_page(pdf, f"DESCRIPTIVE | Slides 9, 20, 21 | {o.upper()} by year of {TRAUMA_EXPOSURE_LABEL} "
+                             f"diagnosis | {age_label}", df, font_size=7.5,
+                        note="Each point on slides 9/20 = rate / general rate of that row. Rows with few "
+                             "events (or little PY, e.g. 2026) give unstable IRRs.")
+
+
+def desc_second_dx_year_page(pdf, frame, age_label):
+    entry = first_of(frame, TRAUMA_EXPOSURE_OUTCOMES)
+    rows = {}
+    for o in FOCUS_OUTCOMES:
+        down = frame[f"first_{o}"]
+        for side_name, side_entry in [("trauma pre", entry.where(entry < OCT7)),
+                                      ("trauma post", entry.where(entry >= OCT7))]:
+            ev, py = split_person_time_by_period(side_entry, down, FIXED_WINDOW_DAYS, SECOND_DIAGNOSIS_PERIODS)
+            rows[f"{o.upper()} | {side_name} | events"] = {k.replace("\n", " "): v for k, v in ev.items()}
+            rows[f"{o.upper()} | {side_name} | PY"] = {k.replace("\n", " "): v for k, v in py.items()}
+    df = pd.DataFrame(rows).T; df.index.name = "Outcome | group | measure"
+    draw_table_page(pdf, f"DESCRIPTIVE | Slides 10-15 | events and person-years by calendar period of the "
+                         f"2nd diagnosis | {age_label}", df, font_size=7,
+                    note="Slides 11-12 hide periods with fewer than 10 / 30 events; slides 13-15 box each "
+                         "period's IRR. Box 1 = 'trauma pre' periods before Oct 7, box 2 = 'trauma post', "
+                         "box 3 = 'trauma pre' periods from Oct 7.")
+
+
+def desc_patient_level_page(pdf, frame, age_label):
+    rows = {}
+    box_names = {1: "box 1: trauma & 2nd dx before Oct 7", 2: "box 2: both on/after Oct 7",
+                 3: "box 3: trauma before, 2nd dx after"}
+    for o in FOCUS_OUTCOMES:
+        for g, (side_t, side_e) in {1: ("pre", "pre"), 2: ("post", "post"), 3: ("pre", "post")}.items():
+            days = compute_time_to_second_dx(frame, o, side_t, side_e)
+            rows[f"{o.upper()} | {box_names[g]}"] = {
+                "converters": len(days),
+                "median days": np.median(days) if len(days) else np.nan,
+                "Q1 days": np.percentile(days, 25) if len(days) else np.nan,
+                "Q3 days": np.percentile(days, 75) if len(days) else np.nan}
+        for g in (1, 2, 3):
+            t_enter, t_exit, is_event = km_intervals(frame, o, g)
+            rows[f"{o.upper()} | KM curve {g}"] = {
+                "KM patients": len(t_exit), "KM events": int(is_event.sum()),
+                "KM censored": int((~is_event).sum()),
+                "median days at risk": np.median(t_exit - t_enter) if len(t_exit) else np.nan}
+    df = pd.DataFrame(rows).T; df.index.name = "Outcome | group"
+    draw_table_page(pdf, f"DESCRIPTIVE | Slides 16-19 | patient-level groups: converters (box plot) and "
+                         f"Kaplan-Meier curves | {age_label}", df, font_size=7.5,
+                    note="KM curve 1 = trauma before Oct 7 followed until Oct 7; curve 2 = trauma on/after "
+                         "Oct 7; curve 3 = trauma before Oct 7 followed from Oct 7 (delayed entry).")
+
+
+def desc_statement2_page(pdf, frame, age_label):
+    rows = {}
+    for exp_label, outcome_list in current_alt_exposures_7().items():
+        entry = first_of(frame, outcome_list)
+        r = {"exposed": int(entry.notna().sum()),
+             "before Oct 7": int((entry < OCT7).sum()), "on/after Oct 7": int((entry >= OCT7).sum())}
+        for o in FOCUS_OUTCOMES:
+            if o in outcome_list:
+                r[f"{o}: at risk"] = r[f"{o}: events"] = "self"
+                continue
+            det, _ = exposed_followup_detail(entry, frame[f"first_{o}"])
+            r[f"{o}: at risk"] = len(det)
+            r[f"{o}: events"] = int(det["event"].sum())
+            r[f"{o}: events pre / post"] = (f"{int(det.loc[det['entry'] < OCT7, 'event'].sum()):,} / "
+                                            f"{int(det.loc[det['entry'] >= OCT7, 'event'].sum()):,}")
+        rows[exp_label] = r
+    df = pd.DataFrame(rows).T; df.index.name = "Entry diagnosis"
+    draw_table_page(pdf, f"DESCRIPTIVE | Slides 22-25 | each entry diagnosis: group sizes and events "
+                         f"within {FIXED_WINDOW_DAYS//30}mo | {age_label}", df, font_size=7.5,
+                    note="Each row's general population = never diagnosed with THAT entry diagnosis, so it "
+                         "differs per row. 'self' = the entry diagnosis is the outcome itself (not shown).")
+
+
+def desc_statement3_pages(pdf, frame, age_label):
+    q_index = pd.period_range("2017Q1", "2026Q2", freq="Q")
+    py = quarterly_person_years(frame, q_index)
+    fig, ax = plt.subplots(figsize=(14, 5.5))
+    x = np.arange(len(q_index))
+    for z in ZONE_ORDER:
+        ax.plot(x, py[z].values, marker="o", markersize=3, label=ZONE_LABELS[z], color=ZONE_COLORS[z])
+    oct7_pos = list(q_index).index(pd.Period("2023Q4", freq="Q"))
+    ax.axvline(oct7_pos - 0.5, color="black", linestyle="--", linewidth=1.2)
+    year_ticks = [i for i, q in enumerate(q_index) if q.quarter == 1]
+    ax.set_xticks(year_ticks); ax.set_xticklabels([str(q_index[i].year) for i in year_ticks], fontsize=8)
+    ax.set_ylabel("Person-years of members per quarter", fontsize=8)
+    ax.set_title(f"DESCRIPTIVE | Slides 26-34 | the denominator: person-years under follow-up per quarter, "
+                 f"by zone | {age_label}", fontsize=10, fontweight="bold", loc="left")
+    ax.legend(fontsize=8)
+    plt.tight_layout(); pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+    entry = first_of(frame, TRAUMA_EXPOSURE_OUTCOMES)
+    rows = {}
+    for z in ZONE_ORDER:
+        m = frame["zone"] == z
+        r = {"patients": int(m.sum()), "% of age band": m.mean() * 100,
+             f"% ever {TRAUMA_EXPOSURE_LABEL}": entry[m].notna().mean() * 100 if m.any() else np.nan}
+        for item in ["ptsd", "asr", "psychosis", "bipolar"]:
+            if f"first_{item}" not in frame.columns:
+                continue
+            d = frame.loc[m, f"first_{item}"]
+            r[f"{item}: new dx pre"] = int(((d >= REGISTRY_START) & (d < OCT7)).sum())
+            r[f"{item}: new dx post"] = int(((d >= OCT7) & (d <= STUDY_END)).sum())
+        rows[ZONE_LABELS[z]] = r
+    df = pd.DataFrame(rows).T; df.index.name = "Zone"
+    draw_table_page(pdf, f"DESCRIPTIVE | Slides 26-34 | zone sizes and raw counts of new diagnoses | {age_label}",
+                    df, font_size=7.5,
+                    note=f"pre = {REGISTRY_START:%d.%m.%Y} to 6.10.2023 (~6.8 years); post = 7.10.2023 to "
+                         f"{STUDY_END:%d.%m.%Y} (~2.7 years) -- compare the slides' rates, not these raw counts.")
+
+
+def desc_statement5_page(pdf, outcome_meta, age_label):
+    rows = {}
+    for o in ALL_OUTCOMES:
+        dates = outcome_meta[o]["date"]
+        codes = normalize_profession_code(outcome_meta[o]["profession"])
+        r = {}
+        for side_name, side_mask in [("pre", dates < OCT7), ("post", dates >= OCT7)]:
+            m = dates.notna() & side_mask
+            n = int(m.sum())
+            r[f"{side_name}: first dx"] = n
+            r[f"{side_name}: % code 999"] = codes[m].isin(MISSING_PROFESSION_CODES).mean() * 100 if n else np.nan
+            r[f"{side_name}: % no profession"] = codes[m].isna().mean() * 100 if n else np.nan
+        rows[o.upper()] = r
+    df = pd.DataFrame(rows).T; df.index.name = "Diagnosis"
+    draw_table_page(pdf, f"DESCRIPTIVE | Slides 35-36 | first-ever diagnoses and missing diagnoser "
+                         f"profession | {age_label}", df,
+                    note="Slide 35 drops code 999 from the denominator, slide 36 counts it as "
+                         "non-psychiatrist -- the larger '% code 999', the more the two slides differ.")
+
+
+def desc_statement6_page(pdf, frame, age_label):
+    entry = first_of(frame, TRAUMA_EXPOSURE_OUTCOMES)
+    rows = {}
+    for o in S1_DOWNSTREAM:
+        down = frame[f"first_{o}"]
+        for side_name, side_mask in [("pre", entry < OCT7), ("post", entry >= OCT7)]:
+            conv = entry.notna() & side_mask & down.notna() & (down > entry)
+            lat = (down[conv] - entry[conv]).dt.days / 30.44
+            n = len(lat)
+            rows[f"{o.upper()} | trauma {side_name}"] = {
+                "exposed": int((entry.notna() & side_mask).sum()), "converters (any time)": n,
+                "median months": lat.median() if n else np.nan,
+                "% within 1 month": (lat < 1).mean() * 100 if n else np.nan,
+                f"% within {FIXED_WINDOW_DAYS//30} months": (lat < FIXED_WINDOW_DAYS / 30.44).mean() * 100 if n else np.nan,
+                "max months possible": (STUDY_END - entry[entry.notna() & side_mask].min()).days / 30.44
+                                       if (entry.notna() & side_mask).any() else np.nan}
+    df = pd.DataFrame(rows).T; df.index.name = "Outcome | trauma timing"
+    draw_table_page(pdf, f"DESCRIPTIVE | Slides 37-42 | latency summary (no window, no membership cap) | "
+                         f"{age_label}", df, font_size=7.5,
+                    note="Post-Oct7 trauma patients can be followed at most ~33 months, so their latency "
+                         "distribution is cut short by design -- compare shapes up to that point only.")
+
+
+def write_descriptive_pdf(output_pdf, frame, entry_meta, outcome_profession_meta, age_label):
+    with PdfPages(output_pdf) as pdf:
+        desc_overview_page(pdf, frame, age_label)
+        desc_statement1_pages(pdf, frame, age_label)
+        desc_old_method_tests_page(pdf, frame, entry_meta, age_label)
+        desc_yearly_pages(pdf, frame, age_label)
+        desc_second_dx_year_page(pdf, frame, age_label)
+        desc_patient_level_page(pdf, frame, age_label)
+        desc_statement2_page(pdf, frame, age_label)
+        desc_statement3_pages(pdf, frame, age_label)
+        desc_statement5_page(pdf, outcome_profession_meta, age_label)
+        desc_statement6_page(pdf, frame, age_label)
+    print(f"  Saved: {output_pdf}")
+
+
 # --- Write the 2 age-band PDFs for the CURRENTLY ACTIVE trauma mode + diagnoser mode (module
 # globals TRAUMA_EXPOSURE_OUTCOMES/LABEL, CURRENT_DIAGNOSER_MODE) -- call set_trauma_mode() /
 # set_diagnoser_mode() first, or use export_all_diagnoser_modes() below to run all 3 diagnoser
@@ -3093,6 +3557,9 @@ def export_all(frame_full, entry_meta_full, downstream_meta_full, outcome_profes
             print("  Statement 6...")
             write_statement6(pdf, frame, label)
         print(f"  Saved: {output_pdf}")
+        print("  Descriptive companion...")
+        write_descriptive_pdf(output_pdf.replace(".pdf", "_descriptive.pdf"),
+                              frame, entry_meta, outcome_profession_meta, label)
 
 
 def set_trauma_mode(mode_key):
