@@ -284,6 +284,12 @@ _current_outcome_profession_meta = None   # set by set_diagnoser_mode(); needed 
 # re-run to get the other trauma mode's 6 files instead of generating all 18 at once.
 SELECTED_TRAUMA_MODE = "ptsd_asr"   # one of: "ptsd_asr", "ptsd_only", "asr_only"
 
+# --- SLIM_RUN: True -> write ONLY presentation_summary_age15_40_<trauma>_24mo_any_diagnoser.pdf
+# (one age band, one window, one diagnoser mode; no demographic / relative-year PDFs; sanity
+# checks still print to the console but no report file). False -> the full 12-file run.
+SLIM_RUN = True
+SLIM_AGE_BAND, SLIM_WINDOW, SLIM_DIAGNOSER = "age15_40", "24mo", "any_diagnoser"
+
 # --- Statement 1 & 2: exposure definitions -----------------------------------
 # 7 possible entry exposures (every outcome group can be an "entry" diagnosis). The trauma
 # entry is built dynamically from TRAUMA_EXPOSURE_OUTCOMES/LABEL so it follows the active
@@ -2807,9 +2813,11 @@ def load_and_build(input_file):
 # set_diagnoser_mode() first, or use export_all_diagnoser_modes() below to run all 3 diagnoser
 # modes automatically for one trauma mode. ---
 def export_all(frame_full, entry_meta_full, downstream_meta_full, outcome_profession_meta_full,
-               output_dir, file_suffix=""):
+               output_dir, file_suffix="", age_keys=None):
     os.makedirs(output_dir, exist_ok=True)
     for age_key, (age_label, lo, hi) in AGE_BANDS.items():
+        if age_keys is not None and age_key not in age_keys:
+            continue
         frame, entry_meta, downstream_meta, outcome_profession_meta = apply_age(
             frame_full, entry_meta_full, downstream_meta_full, outcome_profession_meta_full, lo, hi)
         label = (f"{age_label} | {CURRENT_DIAGNOSER_LABEL}"
@@ -3078,14 +3086,24 @@ def export_all_diagnoser_modes(input_file, output_dir, trauma_mode=None):
         load_and_build(input_file)
     set_trauma_mode(trauma_mode)
     print(f"\n{'='*70}\nTRAUMA MODE: {trauma_mode} ({TRAUMA_EXPOSURE_LABEL})\n{'='*70}")
-    for window_key in WINDOW_MODES:
+    window_keys    = [SLIM_WINDOW] if SLIM_RUN else list(WINDOW_MODES)
+    diagnoser_keys = [SLIM_DIAGNOSER] if SLIM_RUN else list(DIAGNOSER_MODES)
+    age_keys       = [SLIM_AGE_BAND] if SLIM_RUN else None
+    for window_key in window_keys:
         set_window_mode(window_key)
         print(f"\n{'#'*70}\nWINDOW MODE: {window_key} ({FIXED_WINDOW_DAYS} days)\n{'#'*70}")
-        for diagnoser_key in DIAGNOSER_MODES:
+        for diagnoser_key in diagnoser_keys:
             set_diagnoser_mode(diagnoser_key, outcome_profession_meta_full)
             print(f"\n{'-'*70}\nDIAGNOSER MODE: {diagnoser_key} ({CURRENT_DIAGNOSER_LABEL})\n{'-'*70}")
             export_all(frame_full, entry_meta_full, downstream_meta_full, outcome_profession_meta_full,
-                      output_dir, file_suffix=f"_{trauma_mode}_{window_key}_{diagnoser_key}")
+                      output_dir, file_suffix=f"_{trauma_mode}_{window_key}_{diagnoser_key}",
+                      age_keys=age_keys)
+
+    if SLIM_RUN:
+        run_sanity_checks(frame_full, entry_meta_full, downstream_meta_full, outcome_profession_meta_full)
+        set_diagnoser_mode("any_diagnoser", outcome_profession_meta_full)
+        set_window_mode("12mo")
+        return
 
     # ONE demographic-comparison PDF, not multiplied across the 12 combinations above -- uses
     # the "any_diagnoser" / trauma_mode setting (demographics of the trauma diagnosis itself,
@@ -3111,8 +3129,9 @@ INPUT_FILE = r"\\10.100.117.220\Projects$\R12-MHRC\Psychosis_Oct7_6Year_Amir\sag
 OUTPUT_DIR = r"\\10.100.117.220\Projects$\R12-MHRC\Psychosis_Oct7_6Year_Amir\sagifolder\OutPutWorkingFiles\PDF_PostWarPsychosis\PresentationSummary"
 
 if __name__ == "__main__":
-    # Runs 12 files: 2 age bands x 3 diagnoser modes x 2 window modes, for SELECTED_TRAUMA_MODE
-    # above. To run all 3 trauma modes without diagnoser/window variation instead (the older,
+    # SLIM_RUN=True (default): 1 file only -- see SLIM_RUN above. SLIM_RUN=False: 12 files,
+    # 2 age bands x 3 diagnoser modes x 2 window modes, for SELECTED_TRAUMA_MODE above.
+    # To run all 3 trauma modes without diagnoser/window variation instead (the older,
     # simpler 6-file workflow from before these features), call
     # export_all_trauma_modes(INPUT_FILE, OUTPUT_DIR) instead.
     export_all_diagnoser_modes(INPUT_FILE, OUTPUT_DIR)
