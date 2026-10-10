@@ -1655,6 +1655,146 @@ def draw_time_to_second_dx_boxplot(ax, frame, downstream_outcome):
     ax.tick_params(axis="x", labelsize=6.5)
 
 
+# --- PATIENT-LEVEL cumulative incidence (1 - Kaplan-Meier), ALL exposed patients ---------------
+# Unlike the time-to-2nd-dx boxplot (converters only), every exposed patient is in the curve:
+# time 0 = trauma entry, an event = the 2nd diagnosis, and a patient whose follow-up ends
+# without one (window end, fu_end = left Clalit, STUDY_END) is CENSORED -- they leave the risk
+# set instead of being counted as "never converted". At-risk rules are the same as
+# person_time_events_and_years() (prevalent cases excluded, LAG_DAYS honored).
+# Three curves, mirroring the boxplots:
+#   1 (gray)        = trauma before Oct7, followed only UNTIL Oct7 (censored at Oct7)
+#   2 (red)         = trauma on/after Oct7
+#   3 (gray dashed) = trauma before Oct7, followed only FROM Oct7 -- delayed entry: each patient
+#                     joins the risk set at their own time-since-trauma on Oct7 (left truncation)
+# Test: log-rank, curve 1 vs curve 2 (two-sided). Curve 3 is NOT tested.
+KM_GROUP_STYLES = {1: ("#7f8c8d", "-",  "trauma before Oct7 (followed until Oct7)"),
+                   2: ("#e63946", "-",  "trauma on/after Oct7"),
+                   3: ("#7f8c8d", "--", "trauma before Oct7 (followed from Oct7)")}
+
+
+def km_intervals(frame, downstream_outcome, group):
+    """Per-patient (t_enter, t_exit, event) in days since trauma entry, for KM group 1/2/3."""
+    first_trauma = first_of(frame, TRAUMA_EXPOSURE_OUTCOMES)
+    entry = first_trauma.where((first_trauma >= OCT7) if group == 2 else (first_trauma < OCT7)).dropna()
+    event = frame[f"first_{downstream_outcome}"].reindex(entry.index)
+    prevalent = event.notna() & (event <= entry)
+    entry, event = entry[~prevalent], event[~prevalent]
+
+    window_end = entry + pd.to_timedelta(FIXED_WINDOW_DAYS, unit="D")
+    boundary = window_end.where(window_end <= STUDY_END, STUDY_END)
+    fu_end = followup_end_for(entry.index)
+    boundary = boundary.where(boundary <= fu_end, fu_end)
+    is_event = event.notna() & (event > entry) & (event <= boundary)
+    if LAG_DAYS > 0:
+        is_event &= (event - entry).dt.days >= LAG_DAYS
+    exit_date = boundary.where(~is_event, event)
+
+    enter_date = entry.copy()
+    if group == 1:                       # censor at Oct7
+        is_event &= exit_date < OCT7
+        exit_date = exit_date.where(exit_date < OCT7, OCT7)
+    elif group == 3:                     # delayed entry at Oct7, only if still at risk then
+        still_at_risk = exit_date > OCT7
+        enter_date, exit_date, is_event = (pd.Series(OCT7, index=entry.index)[still_at_risk],
+                                           exit_date[still_at_risk], is_event[still_at_risk])
+        entry = entry[still_at_risk]
+
+    t_enter = (enter_date - entry).dt.days.values.astype(float)
+    t_exit = (exit_date - entry).dt.days.values.astype(float)
+    keep = t_exit > t_enter
+    return t_enter[keep], t_exit[keep], is_event.values[keep]
+
+
+def risk_set_sizes(t_enter, t_exit, times):
+    """n at risk at each time t: entered before t and not yet exited (t_enter < t <= t_exit)."""
+    return (np.searchsorted(np.sort(t_enter), times, side="left")
+            - np.searchsorted(np.sort(t_exit), times, side="left"))
+
+
+def km_cumulative_incidence(t_enter, t_exit, is_event):
+    """Returns (times, cum_inc, ci_low, ci_high) -- 1-KM with delayed entry, Greenwood variance,
+    log(-log) CI. times starts at 0 with cum_inc 0."""
+    ev_times = np.unique(t_exit[is_event])
+    d = np.array([np.sum((t_exit == t) & is_event) for t in ev_times]) if len(ev_times) else np.array([])
+    n = risk_set_sizes(t_enter, t_exit, ev_times)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        surv = np.cumprod(1 - d / n)
+        green = np.cumsum(d / (n * (n - d)))
+        log_s = np.log(surv)
+        se_loglog = np.sqrt(green) / np.abs(log_s)
+        lo_s = np.exp(-np.exp(np.log(-log_s) + 1.96 * se_loglog))
+        hi_s = np.exp(-np.exp(np.log(-log_s) - 1.96 * se_loglog))
+    times = np.concatenate([[0], ev_times])
+    cum = np.concatenate([[0], 1 - surv])
+    lo = np.concatenate([[0], np.nan_to_num(1 - hi_s, nan=0)])
+    hi = np.concatenate([[0], np.nan_to_num(1 - lo_s, nan=1)])
+    return times, cum, lo, hi
+
+
+def logrank_test(a, b):
+    """Two-sided log-rank p-value between two (t_enter, t_exit, is_event) groups."""
+    times = np.unique(np.concatenate([a[1][a[2]], b[1][b[2]]]))
+    if len(times) == 0:
+        return np.nan
+    d1 = np.array([np.sum((a[1] == t) & a[2]) for t in times])
+    d2 = np.array([np.sum((b[1] == t) & b[2]) for t in times])
+    n1, n2 = risk_set_sizes(a[0], a[1], times), risk_set_sizes(b[0], b[1], times)
+    n, dd = n1 + n2, d1 + d2
+    ok = n > 1
+    e1 = dd[ok] * n1[ok] / n[ok]
+    v = dd[ok] * (n1[ok] / n[ok]) * (1 - n1[ok] / n[ok]) * (n[ok] - dd[ok]) / (n[ok] - 1)
+    if v.sum() <= 0:
+        return np.nan
+    chi2 = (d1[ok].sum() - e1.sum()) ** 2 / v.sum()
+    return stats.chi2.sf(chi2, df=1)
+
+
+def draw_km_cumulative_incidence(ax, frame, downstream_outcome):
+    groups = {g: km_intervals(frame, downstream_outcome, g) for g in (1, 2, 3)}
+    horizon = FIXED_WINDOW_DAYS
+    for g, (t_enter, t_exit, is_event) in groups.items():
+        color, ls, label = KM_GROUP_STYLES[g]
+        if len(t_exit) == 0:
+            continue
+        times, cum, lo, hi = km_cumulative_incidence(t_enter, t_exit, is_event)
+        months = times / 30.44
+        ax.step(months, cum * 100, where="post", color=color, linestyle=ls, linewidth=1.8,
+               label=f"{label}: {cum[-1]*100:.2f}% [{lo[-1]*100:.2f}-{hi[-1]*100:.2f}] "
+                     f"(n={len(t_exit):,}, events={int(is_event.sum()):,})")
+        ax.fill_between(months, lo * 100, hi * 100, step="post", color=color, alpha=0.12)
+
+    p = logrank_test(groups[1], groups[2])
+    p_str = f"{p:.3g}" if pd.notna(p) else "n/a"
+
+    # number-at-risk row under the x-axis, every 6 months
+    horizon_mo = round(horizon / 30.44)
+    ticks = np.arange(0, horizon_mo + 1, 6)
+    ax.set_xticks(ticks)
+    ax.set_xlim(0, horizon_mo)
+    tick_days = np.clip(ticks * 30.44, 0.5, horizon)   # 0.5: just after entry; cap at window end
+    for row, g in enumerate((1, 2, 3)):
+        t_enter, t_exit, _ = groups[g]
+        at_risk = risk_set_sizes(t_enter, t_exit, tick_days) if len(t_exit) else np.zeros(len(ticks))
+        color, ls, _ = KM_GROUP_STYLES[g]
+        y = -0.10 - row * 0.035
+        for x, nr in zip(ticks, at_risk):
+            ax.text(x, y, f"{int(nr):,}", transform=ax.get_xaxis_transform(),
+                   ha="center", va="top", fontsize=6.5, color=color,
+                   fontstyle="italic" if ls == "--" else "normal")
+        ax.text(-0.04, y, f"at risk ({g}):", transform=ax.transAxes, ha="right", va="top",
+               fontsize=6.5, color=color)
+
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel(f"Months since {TRAUMA_EXPOSURE_LABEL} diagnosis", fontsize=8)
+    ax.set_ylabel(f"Cumulative incidence of 2nd diagnosis (%)", fontsize=8)
+    ax.set_title(f"{downstream_outcome.upper()}\n"
+               f"log-rank (two-sided), curve 1 (gray) vs curve 2 (red): p={p_str}\n"
+               f"dashed curve 3 is NOT part of the test", fontsize=9, fontweight="bold")
+    ax.legend(fontsize=6.5, loc="upper left", title=f"% at {horizon//30}mo [95% CI]",
+             title_fontsize=6.5)
+    ax.grid(axis="y", alpha=0.3)
+
+
 # --- Write the 2 min-n-filtered by-second-diagnosis-year pages, then the 3 boxplot pages
 # (no minimum, n>=10, n>=30) -- each boxplot page has 2 panels (Psychosis | Bipolar), and EACH
 # panel is ONE combined graph holding all 3 comparison groups (6 boxes), not 3 separate
@@ -1696,6 +1836,20 @@ def write_statement1_min_n_and_boxplot_pages(pdf, frame, age_label):
                 fontsize=10, fontweight="bold")
     for ax, outcome in zip(axes, FOCUS_OUTCOMES):
         draw_time_to_second_dx_boxplot(ax, frame, outcome)
+    plt.tight_layout()
+    pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+    # patient-level page 2: cumulative incidence over ALL exposed patients (censoring-aware)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7.5))
+    fig.suptitle(f"STATEMENT 1 (supporting) | Cumulative incidence of 2nd diagnosis after "
+                f"{TRAUMA_EXPOSURE_LABEL}, PATIENT-LEVEL (1 - Kaplan-Meier) | {age_label}\n"
+                f"all exposed patients; follow-up ending without a 2nd dx (window / left Clalit / "
+                f"study end) is censored, not counted as 'no conversion'\n"
+                f"curve 3 = pre-Oct7 trauma patients still at risk on Oct7, followed from Oct7 "
+                f"(delayed entry); shaded = 95% CI",
+                fontsize=10, fontweight="bold")
+    for ax, outcome in zip(axes, FOCUS_OUTCOMES):
+        draw_km_cumulative_incidence(ax, frame, outcome)
     plt.tight_layout()
     pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
 
