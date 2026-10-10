@@ -1581,6 +1581,80 @@ def draw_first_second_boxplot_combined(ax, frame, downstream_outcome, min_n=0):
     ax.tick_params(axis="x", labelsize=6.5)
 
 
+# --- PATIENT-LEVEL counterpart of the boxplot above: each point = ONE PATIENT, not one year ---
+# An IRR has no per-patient value, so the per-patient measure is TIME TO SECOND DIAGNOSIS: days
+# from the trauma entry to the downstream diagnosis, for patients who converted inside their
+# follow-up (same rules as person_time_events_and_years(): prevalent cases excluded, event must
+# fall after entry, within FIXED_WINDOW_DAYS, by fu_end/STUDY_END, and not within LAG_DAYS).
+# Same 3 groups as the year-level boxplot, split on the exact dates of both diagnoses:
+#   box 1 (gray) = trauma before Oct7, 2nd dx before Oct7
+#   box 2 (red)  = trauma on/after Oct7 (2nd dx automatically also on/after Oct7)
+#   box 3 (gray, NOT tested) = trauma before Oct7, 2nd dx on/after Oct7
+# One-tail Mann-Whitney U, box 1 > box 2 (patient-level, skewed data -> rank test, not t-test).
+# CAVEAT: this answers "how FAST did converters convert", not "how MANY converted" -- and box 1 /
+# box 2 are both truncated by their own boundary (Oct7 / STUDY_END), which caps latencies for
+# late entrants, so differences can partly reflect available follow-up, not biology.
+def compute_time_to_second_dx(frame, downstream_outcome, trauma_side, event_side):
+    """Days from trauma entry to 2nd diagnosis, one value per converting patient.
+    trauma_side: 'pre'/'post' Oct7. event_side: 'pre'/'post' Oct7 (2nd dx date) or 'all'."""
+    first_trauma = first_of(frame, TRAUMA_EXPOSURE_OUTCOMES)
+    entry = first_trauma.where((first_trauma < OCT7) if trauma_side == "pre" else (first_trauma >= OCT7))
+    entry = entry.dropna()
+    event = frame[f"first_{downstream_outcome}"].reindex(entry.index)
+
+    window_end = entry + pd.to_timedelta(FIXED_WINDOW_DAYS, unit="D")
+    boundary = window_end.where(window_end <= STUDY_END, STUDY_END)
+    fu_end = followup_end_for(entry.index)
+    boundary = boundary.where(boundary <= fu_end, fu_end)
+
+    is_event = event.notna() & (event > entry) & (event <= boundary)
+    if LAG_DAYS > 0:
+        is_event &= (event - entry).dt.days >= LAG_DAYS
+    if event_side == "pre":
+        is_event &= event < OCT7
+    elif event_side == "post":
+        is_event &= event >= OCT7
+    return (event[is_event] - entry[is_event]).dt.days.values
+
+
+def draw_time_to_second_dx_boxplot(ax, frame, downstream_outcome):
+    box1 = compute_time_to_second_dx(frame, downstream_outcome, "pre",  "pre")
+    box2 = compute_time_to_second_dx(frame, downstream_outcome, "post", "post")
+    box3 = compute_time_to_second_dx(frame, downstream_outcome, "pre",  "post")
+    groups = [box1, box2, box3]
+
+    names = ["trauma before Oct7\n(2nd dx: also before Oct7)",
+             "trauma on/after Oct7\n(2nd dx: also on/after Oct7)",
+             "trauma before Oct7\n(2nd dx: on/after Oct7)"]
+    labels = [f"{nm}\nn={len(v):,}" + (f", median={np.median(v):.0f}d" if len(v) else "")
+              for nm, v in zip(names, groups)]
+    bp = ax.boxplot(groups, positions=[1, 2, 3], widths=0.5, labels=labels,
+                    patch_artist=True, showmeans=True, showfliers=False)
+    for patch, color in zip(bp["boxes"], ["#95a5a6", "#e63946", "#95a5a6"]):
+        patch.set_facecolor(color); patch.set_alpha(0.6)
+
+    rng = np.random.default_rng(42)   # fixed seed -- reproducible jitter, doesn't affect the test
+    for pos, vals in zip([1, 2, 3], groups):
+        if len(vals) > 0:
+            jitter = rng.uniform(-0.18, 0.18, size=len(vals))
+            ax.scatter(np.full(len(vals), pos) + jitter, vals, color="black",
+                      alpha=0.25 if len(vals) > 200 else 0.5, s=6, zorder=3, linewidths=0)
+
+    pval_str = "n/a (need >=2 each)"
+    if len(box1) >= 2 and len(box2) >= 2:
+        _, p = stats.mannwhitneyu(box1, box2, alternative="greater")
+        pval_str = f"{p:.3g}"
+
+    ax.set_ylim(bottom=0)
+    ax.set_ylabel(f"Days from {TRAUMA_EXPOSURE_LABEL} to 2nd diagnosis\n"
+                 f"(converters within {FIXED_WINDOW_DAYS//30}mo)", fontsize=8)
+    ax.set_title(f"{downstream_outcome.upper()}\n"
+               f"one-tail Mann-Whitney, box 1 (gray) > box 2 (red): p={pval_str}\n"
+               f"box 3 (gray, right) is NOT part of the test",
+               fontsize=9, fontweight="bold")
+    ax.tick_params(axis="x", labelsize=6.5)
+
+
 # --- Write the 2 min-n-filtered by-second-diagnosis-year pages, then the 3 boxplot pages
 # (no minimum, n>=10, n>=30) -- each boxplot page has 2 panels (Psychosis | Bipolar), and EACH
 # panel is ONE combined graph holding all 3 comparison groups (6 boxes), not 3 separate
@@ -1610,6 +1684,20 @@ def write_statement1_min_n_and_boxplot_pages(pdf, frame, age_label):
             draw_first_second_boxplot_combined(ax, frame, outcome, min_n)
         plt.tight_layout()
         pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+    # patient-level page: each point = one patient (time to 2nd diagnosis), not one year's IRR
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+    fig.suptitle(f"STATEMENT 1 (supporting) | Time from 1st (trauma) to 2nd (outcome) diagnosis, "
+                f"PATIENT-LEVEL | {age_label}\n"
+                f"each point = one patient who converted within {FIXED_WINDOW_DAYS//30}mo | "
+                f"PRE-war vs POST-war tested (one-tail Mann-Whitney); cross-reference group NOT tested\n"
+                f"CAUTION: measures speed of conversion among converters, not how many converted; "
+                f"late entrants have less follow-up to convert in",
+                fontsize=10, fontweight="bold")
+    for ax, outcome in zip(axes, FOCUS_OUTCOMES):
+        draw_time_to_second_dx_boxplot(ax, frame, outcome)
+    plt.tight_layout()
+    pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
 
 
 # --- T-Yearly-Forecast: quantitative version of "gradual decline vs sharp break" ---------------
