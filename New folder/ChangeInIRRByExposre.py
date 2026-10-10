@@ -64,8 +64,8 @@ warnings.filterwarnings("ignore")
 #      cohort composition alone.
 #   3. The general/reference population is measured via CONTINUOUS DYNAMIC-EXPOSURE LEXIS
 #      TRACKING (compute_general_lexis_split()), not a fixed window from an anchor point: every
-#      patient is tracked as "general" from REGISTRY_START (2017-01-01) until they get exposed
-#      (raw exposure date, any diagnoser), get the downstream outcome, or STUDY_END --
+#      patient is tracked as "general" from max(REGISTRY_START, fu_start) until they get exposed
+#      (raw exposure date, any diagnoser), get the downstream outcome, or fu_end --
 #      whichever comes first -- and that continuous interval is split across whatever calendar
 #      periods a given chart needs (a single whole-period total for H2/heatmaps/B1, or
 #      per-year/per-quarter slices for the trend charts). This replaced an earlier design that
@@ -83,6 +83,11 @@ warnings.filterwarnings("ignore")
 #      as a "hit" if it falls within LAG_DAYS of entry (protopathic-bias / same-episode
 #      relabeling concern) -- not enabled by default; Statement 6's latency histograms are the
 #      empirical basis for deciding whether a specific value is warranted.
+#   7. Person-time only counts while the patient was actually under Clalit follow-up --
+#      [fu_start, fu_end] = current continuous membership, from age 15 and from immigration,
+#      until leaving Clalit / death / STUDY_END. Exposures outside that window aren't entries,
+#      and prevalent cases (outcome already on/before the at-risk start) are excluded. See
+#      FOLLOW-UP WINDOW below.
 # This means Statement 1 page 1 and Statement 2 page 1 do NOT reproduce the original H2/B1
 # images' raw numbers anymore (those used unrestricted, any-time-ever, patient-count-based
 # follow-up) -- that divergence is intentional, per explicit instruction, not a bug.
@@ -173,7 +178,8 @@ warnings.filterwarnings("ignore")
 #   Run on both age bands.
 #
 # STATEMENT 3 (what rose vs. did not rise after Oct 7):
-#   One page per item, quarterly new-dx-per-1,000-residents by zone -- same
+#   One page per item, quarterly new-dx-per-1,000-person-years by zone (person-years of
+#   members under follow-up in that quarter, not a fixed zone headcount) -- same
 #   metric as Direction 3's SUPPRESSION analysis, but with zones REDEFINED to
 #   include a "Northern Border" category (per the docx's "ADD NORTH BORDER
 #   HERE" note), using the exact 3-zone scheme from Alarms_Step5_1.py:
@@ -322,6 +328,47 @@ REGISTRY_START = pd.Timestamp("2017-01-01")   # earliest point with data -- star
                                               # general-population tracking (see PERSON-TIME
                                               # CORE below). Replaces the old 5-anchor design.
 
+# --- FOLLOW-UP WINDOW: when each patient was actually under Clalit's medical monitoring -------
+# A diagnosis can only be recorded while a patient is an active member, so person-time outside
+# membership is time in which an event is invisible -- counting it inflates the denominator.
+# Before this, every patient was counted as at risk from REGISTRY_START to STUDY_END, which
+# inflated the EARLY years most (10% of the cohort joined after 2017, ~17% turned 15/18 after
+# 2017) and kept counting people who left Clalit or died (~9%) until STUDY_END.
+# Per patient (built in build_frame()):
+#   fu_start = latest of (start of the CURRENT continuous membership, immigration date, 15th birthday)
+#   fu_end   = earliest of (end of that membership, STUDY_END)
+# The "cohort reference event-membership" columns are used, NOT "clalit membership": the clalit
+# ones describe the FIRST membership episode ever (22% of patients left and re-joined, and for
+# them clalit_start..clalit_end is an old episode followed by a gap). The cohort columns are the
+# continuous episode the patient is in now. End date 2079-06-06 = still a member (placeholder,
+# capped at STUDY_END).
+# Rules that follow from this, applied to EVERY person-time calculation below:
+#   - EXPOSED: an exposure only counts as an entry if diagnosed inside [fu_start, fu_end]
+#     (enforced in first_of()). A first-ever exposure before fu_start (before age 15, before
+#     immigration, or during an earlier membership episode) means the patient is in neither
+#     group -- not exposed (we can't follow them from diagnosis) and not general (they were
+#     exposed). Follow-up after entry also ends at fu_end (left Clalit / died).
+#   - GENERAL: tracked from max(REGISTRY_START, fu_start) instead of REGISTRY_START for everyone.
+#   - PREVALENT CASES: a patient whose first-ever outcome is dated on/before the start of their
+#     at-risk time (entry for exposed, start of general tracking for general) is not at risk of
+#     a FIRST-ever outcome and contributes no person-time for that outcome.
+MEMBERSHIP_START_COL = "cohort reference event-membership start date"
+MEMBERSHIP_END_COL   = "cohort reference event-membership end date"
+FOLLOWUP_MIN_AGE     = 15
+_followup_end = None   # per-patient fu_end Series (full-population index), set by set_followup()
+
+
+def set_followup(frame):
+    global _followup_end
+    _followup_end = frame["fu_end"]
+
+
+def followup_end_for(index):
+    """fu_end for the given patients; STUDY_END for everyone if set_followup() wasn't called."""
+    if _followup_end is None:
+        return pd.Series(STUDY_END, index=index)
+    return _followup_end.reindex(index)
+
 # --- LAG_DAYS: protopathic-bias exclusion window, OFF by default (0) -----------------------
 # If > 0, a downstream diagnosis occurring within LAG_DAYS of the entry diagnosis is NOT
 # counted as a "hit" -- the concern is that a diagnosis given days-to-weeks after entry may
@@ -357,14 +404,18 @@ def person_time_events_and_years(entry_dates, event_dates, window_days=None, lag
     (this script only has first-ever dates, not recurrences, so there is no later event to
     still count for them)."""
     window_days = FIXED_WINDOW_DAYS if window_days is None else window_days
-    # Prevalent cases (outcome already diagnosed on/before entry) are not at risk of a FIRST
-    # diagnosis -- excluded entirely, so they don't add event-free person-time to the denominator.
-    valid = entry_dates.notna() & ~(event_dates.reindex(entry_dates.index) <= entry_dates)
+    valid = entry_dates.notna()
     entry = entry_dates[valid]
     event = event_dates.reindex(entry.index)
 
+    # prevalent: already had the outcome on/before entry -- not at risk of a first-ever one
+    prevalent = event.notna() & (event <= entry)
+    entry, event = entry[~prevalent], event[~prevalent]
+
     window_end = entry + pd.to_timedelta(window_days, unit="D")
     boundary = window_end.where(window_end <= STUDY_END, STUDY_END)   # earlier of window/STUDY_END
+    fu_end = followup_end_for(entry.index)
+    boundary = boundary.where(boundary <= fu_end, fu_end)              # ...and of leaving Clalit
 
     is_event = event.notna() & (event > entry) & (event <= boundary)
     if lag_days > 0:
@@ -394,9 +445,10 @@ def person_time_rate(entry_dates, event_dates, window_days=None, lag_days=LAG_DA
 # period it's meant to represent -- it bleeds into the following year(s), so "the general rate
 # for 2023" computed that way was never really just 2023. The correct fix is to drop the
 # window/anchor concept for the general side altogether: every patient is tracked CONTINUOUSLY
-# as "general" (never yet exposed to `exposure_outcomes`) from REGISTRY_START until the
-# EARLIEST of -- they get exposed (raw exposure date, regardless of diagnoser mode -- see note
-# below), they get `downstream_outcome`, or STUDY_END. That continuous interval is then split
+# as "general" (never yet exposed to `exposure_outcomes`) from max(REGISTRY_START, fu_start)
+# until the EARLIEST of -- they get exposed (raw exposure date, regardless of diagnoser mode --
+# see note below), they get `downstream_outcome`, or fu_end (left Clalit / died / STUDY_END --
+# see FOLLOW-UP WINDOW above). That continuous interval is then split
 # across whatever calendar periods the caller asks for (whole years, split-2023 years,
 # quarters, ...) via ordinary Lexis splitting, giving a genuine period-specific rate with no
 # anchor choice involved at all.
@@ -412,13 +464,19 @@ def compute_general_lexis_split(frame, exposure_outcomes, downstream_outcome, pe
     exposure_date = first_of_raw(frame, exposure_outcomes)
     down = frame[f"first_{downstream_outcome}"]
 
-    boundary = exposure_date.where(exposure_date.notna(), STUDY_END).clip(upper=STUDY_END)
-    is_event = down.notna() & (down > REGISTRY_START) & (down <= boundary)
+    # per-patient tracking window: from max(REGISTRY_START, fu_start) to the earliest of
+    # exposure / fu_end (fu_end is already capped at STUDY_END)
+    gen_start = frame["fu_start"].clip(lower=REGISTRY_START)
+    fu_end = frame["fu_end"]
+    boundary = exposure_date.where(exposure_date.notna() & (exposure_date < fu_end), fu_end)
+    prevalent = down.notna() & (down <= gen_start)   # already had the outcome when tracking starts
+    is_event = down.notna() & (down > gen_start) & (down <= boundary)
     end_time = boundary.where(~is_event, down)   # exit exactly at the event if it's counted
+    end_time = end_time.where(~prevalent, gen_start)   # prevalent -> zero person-time
 
     rows = []
     for label, p_start, p_end in periods:
-        seg_start = max(REGISTRY_START, p_start)
+        seg_start = gen_start.clip(lower=p_start)
         overlap_end = end_time.clip(upper=p_end)
         days = (overlap_end - seg_start).dt.days.clip(lower=0)
         person_years = (days / 365.25).sum()
@@ -512,7 +570,9 @@ BASE_COLS = ["patient id", "birth date", "gender",
              "demographics_2023-sector",
              "demographics_2023-district", "country of birth", "immigration date",
              "mailing language", "demographics_2023-insurance type",
-             "charlson - lastuntil2023-charlson score total"]
+             "charlson - lastuntil2023-charlson score total",
+             # --- follow-up (membership) window -- see FOLLOW-UP WINDOW below ---
+             MEMBERSHIP_START_COL, MEMBERSHIP_END_COL]
 # Period-level columns needed for the Statement-1 supporting tests (2b uses the collapsed
 # "_start date" cols already in BASE; 5/9 need entry meta, 6 needs the downstream
 # diagnosis_vector) PLUS Statement 5, which needs "profession" for every outcome and
@@ -592,6 +652,21 @@ def build_frame(df):
     frame["insurance_type"]  = df.get("demographics_2023-insurance type", pd.Series(index=df.index)).values
     frame["charlson_score"]  = pd.to_numeric(
         df.get("charlson - lastuntil2023-charlson score total", pd.Series(index=df.index)), errors="coerce").values
+
+    # --- Follow-up window (see FOLLOW-UP WINDOW near the top of the file) ---
+    if MEMBERSHIP_START_COL in df.columns:
+        membership_start = pd.to_datetime(df[MEMBERSHIP_START_COL], errors="coerce")
+        membership_end   = pd.to_datetime(df[MEMBERSHIP_END_COL], errors="coerce")
+    else:
+        print(f"WARNING: '{MEMBERSHIP_START_COL}' not found -- follow-up falls back to "
+              f"REGISTRY_START..STUDY_END for everyone (membership NOT taken into account)")
+        membership_start = pd.Series(REGISTRY_START, index=df.index)
+        membership_end   = pd.Series(STUDY_END, index=df.index)
+    min_age_date = birth + pd.DateOffset(years=FOLLOWUP_MIN_AGE)
+    frame["fu_start"] = pd.concat([membership_start, frame["immigration_date"], min_age_date],
+                                  axis=1).max(axis=1).values   # NaT immigration/birth are skipped
+    frame["fu_start"] = frame["fu_start"].where(membership_start.notna().values)   # no membership -> no follow-up
+    frame["fu_end"] = membership_end.fillna(STUDY_END).clip(upper=STUDY_END).values   # 2079-06-06 = active
 
     for outcome in ALL_OUTCOMES:
         col = f"{outcome}_start date"
@@ -725,6 +800,8 @@ def _diagnoser_match_mask(frame, outcome_list, raw_dates):
 # ~diagnoser_excluded_mask(...) for exactly this reason.
 def first_of(frame, outcome_list):
     raw_dates = first_of_raw(frame, outcome_list)
+    # only an exposure diagnosed while under follow-up counts as an entry (FOLLOW-UP WINDOW above)
+    raw_dates = raw_dates.where((raw_dates >= frame["fu_start"]) & (raw_dates <= frame["fu_end"]))
     if CURRENT_DIAGNOSER_MODE == "any_diagnoser":
         return raw_dates
     keep = _diagnoser_match_mask(frame, outcome_list, raw_dates)
@@ -1262,9 +1339,9 @@ def draw_zone_panel(ax, frame, downstream_outcome, title):
 # (2017-2019 / 2020-Oct2023 / Oct2023-2026); this instead plots RR by SINGLE CALENDAR YEAR of
 # trauma-entry as a continuous line, so a gradual pre-existing decline (background trend) looks
 # visually different from a sharp break exactly at Oct 7. Same windowed+censored design as
-# everything else in this section, held against one constant general-population reference rate
-# (not re-computed per year) so the line reflects the EXPOSED side moving, not the reference
-# moving under it.
+# everything else in this section; each period's IRR is measured against that SAME period's
+# general-population rate (compute_general_lexis_split() with the same periods), so a
+# background trend in the general population doesn't show up as a change in the IRR.
 # 2023 is SPLIT into two sub-periods (Jan 1-Oct 6, and Oct 7-Dec 31) instead of one calendar-
 # year point -- a single 2023 point would average ~9 months of pre-war data together with ~3
 # months of war-period data, which would blur exactly the break this chart exists to detect.
@@ -1356,8 +1433,13 @@ def split_person_time_by_period(entry_dates, event_dates, window_days, periods):
     entry = entry_dates[valid]
     event = event_dates.reindex(entry.index)
 
+    prevalent = event.notna() & (event <= entry)   # same rule as person_time_events_and_years()
+    entry, event = entry[~prevalent], event[~prevalent]
+
     window_end = entry + pd.to_timedelta(window_days, unit="D")
     boundary = window_end.where(window_end <= STUDY_END, STUDY_END)
+    fu_end = followup_end_for(entry.index)
+    boundary = boundary.where(boundary <= fu_end, fu_end)
     is_event = event.notna() & (event > entry) & (event <= boundary)
     end_time = boundary.where(~is_event, event)
 
@@ -1947,17 +2029,33 @@ def quarterly_counts(frame, item):
     q_index = pd.period_range("2017Q1", "2026Q2", freq="Q")
     outcomes = ALL_OUTCOMES if item == "total" else [item]
     ev = pd.concat(
-        [frame[["zone", f"first_{o}"]].dropna(subset=[f"first_{o}"])
+        [frame[["zone", "fu_start", "fu_end", f"first_{o}"]].dropna(subset=[f"first_{o}"])
               .rename(columns={f"first_{o}": "date"})
          for o in outcomes], ignore_index=True)
+    # only diagnoses made while the patient was under follow-up (same window as the denominator)
+    ev = ev[(ev["date"] >= ev["fu_start"]) & (ev["date"] <= ev["fu_end"])]
     ev["quarter"] = ev["date"].dt.to_period("Q")
     ev = ev[ev["quarter"].isin(q_index)]
     return (ev.groupby(["quarter", "zone"]).size()
            .unstack("zone").reindex(index=q_index, columns=ZONE_ORDER).fillna(0))
 
 
-def to_rate_per_1000(counts, pops):
-    return counts.div(pops.replace(0, np.nan), axis=1) * 1000
+# --- S3, STEP 2b: Person-years under follow-up per quarter per zone (the rate denominator) ---
+# Replaces a fixed zone headcount: a patient only counts toward a quarter for the days they
+# were actually members (and 15+, and in Israel) during it -- so a zone whose population grew
+# over the years no longer shows inflated early-year rates.
+def quarterly_person_years(frame, q_index):
+    rows = {}
+    for q in q_index:
+        seg_start = frame["fu_start"].clip(lower=q.start_time)
+        seg_end   = frame["fu_end"].clip(upper=(q + 1).start_time)
+        py = (seg_end - seg_start).dt.days.clip(lower=0) / 365.25
+        rows[q] = py.groupby(frame["zone"]).sum()
+    return pd.DataFrame(rows).T.reindex(index=q_index, columns=ZONE_ORDER).fillna(0)
+
+
+def to_rate_per_1000_py(counts, person_years):
+    return counts / person_years.replace(0, np.nan) * 1000
 
 
 # --- S3, STEP 3: Draw one quarterly per-1,000-by-zone panel ---
@@ -1972,7 +2070,7 @@ def draw_rate_panel(ax, rate_df, oct7_pos, title, subtitle=None):
     year_ticks = [i for i, q in enumerate(rate_df.index) if q.quarter == 1]
     ax.set_xticks(year_ticks)
     ax.set_xticklabels([str(rate_df.index[i].year) for i in year_ticks], fontsize=8)
-    ax.set_ylabel("New diagnoses per 1,000 zone residents", fontsize=9)
+    ax.set_ylabel("New diagnoses per 1,000 person-years\n(members under follow-up)", fontsize=9)
     if subtitle:
         ax.set_xlabel(subtitle, fontsize=8)
     ax.set_title(title, fontsize=10, fontweight="bold")
@@ -1989,19 +2087,19 @@ def prepost_ratio_text(rate_df):
 
 # --- S3, STEP 4: Write Statement 3 pages (ROSE section, then DID-NOT-RISE section) ---
 def write_statement3(pdf, frame, age_label):
-    pops = zone_populations(frame)
     q_index = pd.period_range("2017Q1", "2026Q2", freq="Q")
+    person_years = quarterly_person_years(frame, q_index)
     oct7_pos = next(i for i, q in enumerate(q_index) if q == pd.Period("2023Q4", freq="Q"))
 
     for section_label, items in [("ROSE AFTER OCT 7", STATEMENT3_ROSE),
                                  ("DID NOT RISE", STATEMENT3_DID_NOT_RISE)]:
         for item in items:
             label = "ALL 8 OUTCOMES" if item == "total" else item.upper()
-            rate = to_rate_per_1000(quarterly_counts(frame, item), pops)
+            rate = to_rate_per_1000_py(quarterly_counts(frame, item), person_years)
             fig, ax = plt.subplots(figsize=(13, 5.5))
             draw_rate_panel(ax, rate, oct7_pos,
                             f"STATEMENT 3 | {section_label} | {label} | "
-                            f"New dx per 1,000 residents | Quarterly by zone | {age_label}",
+                            f"New dx per 1,000 person-years | Quarterly by zone | {age_label}",
                             subtitle=prepost_ratio_text(rate))
             plt.tight_layout()
             pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
@@ -2595,14 +2693,20 @@ def compute_relative_year_split(entry_dates, event_dates, max_years=10, full_yea
     entry = entry_dates[valid]
     event = event_dates.reindex(entry.index)
 
-    is_event = event.notna() & (event > entry) & (event <= OCT7)
-    end_time = pd.Series(OCT7, index=entry.index)
-    end_time = end_time.where(~is_event, event)
+    prevalent = event.notna() & (event <= entry)   # same rule as person_time_events_and_years()
+    entry, event = entry[~prevalent], event[~prevalent]
+
+    # per-patient cap: Oct 7, or earlier if they left Clalit / died before it
+    fu_end = followup_end_for(entry.index)
+    cap = fu_end.where(fu_end < OCT7, OCT7)
+
+    is_event = event.notna() & (event > entry) & (event <= cap)
+    end_time = cap.where(~is_event, event)
 
     events_by_year, py_by_year = {}, {}
 
     for pid in entry.index:
-        e_start, e_end = entry.loc[pid], end_time.loc[pid]
+        e_start, e_end, p_cap = entry.loc[pid], end_time.loc[pid], cap.loc[pid]
         if pd.isna(e_start) or pd.isna(e_end) or e_end <= e_start:
             continue
         ev_date = event.loc[pid] if is_event.loc[pid] else None
@@ -2611,13 +2715,13 @@ def compute_relative_year_split(entry_dates, event_dates, max_years=10, full_yea
         while True:
             bucket_start = e_start + pd.DateOffset(years=k - 1)
             bucket_full_end = e_start + pd.DateOffset(years=k)
-            if bucket_start >= OCT7 or bucket_start >= e_end or k > max_years:
+            if bucket_start >= p_cap or bucket_start >= e_end or k > max_years:
                 break
-            is_full_year = bucket_full_end <= OCT7
+            is_full_year = bucket_full_end <= p_cap
             if full_years_only and not is_full_year:
                 break   # stop here -- partial year not counted, nothing after it either
 
-            bucket_end_capped = min(bucket_full_end, OCT7, e_end)
+            bucket_end_capped = min(bucket_full_end, p_cap, e_end)
             contributed_days = (bucket_end_capped - bucket_start).days
             if contributed_days > 0:
                 py_by_year[k] = py_by_year.get(k, 0.0) + contributed_days / 365.25
@@ -2711,7 +2815,9 @@ def load_and_build(input_file):
     print("Loading input file...")
     df = load_frame(input_file)
     print(f"Loaded {len(df):,} rows.")
-    return build_frame(df)
+    built = build_frame(df)
+    set_followup(built[0])
+    return built
 
 
 # --- Write the 2 age-band PDFs for the CURRENTLY ACTIVE trauma mode + diagnoser mode (module
@@ -2851,9 +2957,26 @@ def _run_sanity_checks_body(frame_full, entry_meta_full, downstream_meta_full, o
     frame = frame_full   # full (un-age-banded) population for these checks
 
     # --- 1. Required derived columns exist on the loaded frame ---
-    expected_cols = [f"first_{o}" for o in ALL_OUTCOMES] + ["zone", "age_at_oct7", "patient id"]
+    expected_cols = [f"first_{o}" for o in ALL_OUTCOMES] + ["zone", "age_at_oct7", "patient id",
+                                                           "fu_start", "fu_end"]
     missing = [c for c in expected_cols if c not in frame.columns]
     check("all expected derived columns present on the loaded frame", not missing, f"missing={missing}")
+
+    # --- 1b. Follow-up window (membership / age 15 / immigration) ---
+    no_fu = frame["fu_start"].isna() | (frame["fu_end"] <= frame["fu_start"])
+    info("patients with NO follow-up time at all (no membership, or window empty)",
+         f"{int(no_fu.sum()):,} ({no_fu.mean():.1%})")
+    info("fu_start after REGISTRY_START (joined / turned 15 / immigrated after 2017)",
+         f"{int((frame['fu_start'] > REGISTRY_START).sum()):,}")
+    info("fu_end before STUDY_END (left Clalit or died)",
+         f"{int((frame['fu_end'] < STUDY_END).sum()):,}")
+    check("fu_end never later than STUDY_END", bool((frame["fu_end"] <= STUDY_END).all()))
+    entry = first_of(frame, TRAUMA_EXPOSURE_OUTCOMES).dropna()
+    in_window = (entry >= frame.loc[entry.index, "fu_start"]) & (entry <= frame.loc[entry.index, "fu_end"])
+    check("every exposed entry date lies inside its patient's follow-up window", bool(in_window.all()))
+    raw = first_of_raw(frame, TRAUMA_EXPOSURE_OUTCOMES)
+    info(f"{TRAUMA_EXPOSURE_LABEL} patients dropped because first diagnosis was outside follow-up",
+         f"{int(raw.notna().sum() - len(entry)):,} of {int(raw.notna().sum()):,}")
 
     # --- 2. zone_populations sums to len(frame), for every age band (exhaustive/mutually
     # exclusive zone assignment -- nobody should be silently dropped) ---
