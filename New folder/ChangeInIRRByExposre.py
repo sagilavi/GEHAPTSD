@@ -343,9 +343,10 @@ REGISTRY_START = pd.Timestamp("2017-01-01")   # earliest point with data -- star
 #   fu_start = later of (REGISTRY_START, 15th birthday) -- only the END comes from membership.
 # Rules, applied to EVERY person-time calculation below:
 #   - EXPOSED: at risk from the exposure (PTSD/ASR) date until the EARLIEST of -- the downstream
-#     diagnosis, entry + FIXED_WINDOW_DAYS, fu_end. A first-ever exposure BEFORE fu_start (before
-#     age 15) is not an entry, and that patient is not general either -- excluded from both
-#     (enforced in first_of()). Membership start / immigration date play no role.
+#     diagnosis, entry + FIXED_WINDOW_DAYS, fu_end. A first-ever exposure before the 15th
+#     birthday is not an entry, and that patient is not general either -- excluded from both
+#     (enforced in first_of()). An exposure before 2017 at age 15+ is still an entry.
+#     Membership start / immigration date play no role.
 #   - GENERAL: tracked from fu_start until the earliest of exposure / downstream / fu_end.
 #   - PREVALENT CASES: a patient whose first-ever outcome is dated on/before the start of their
 #     at-risk time (entry for exposed, fu_start for general) is not at risk of a FIRST-ever
@@ -661,6 +662,7 @@ def build_frame(df):
     # follow-up starts at the later of REGISTRY_START and the 15th birthday (missing birth date
     # -> REGISTRY_START); only the END of follow-up comes from membership
     age15_date = pd.Series((birth + pd.DateOffset(years=FOLLOWUP_MIN_AGE)).values, index=frame.index)
+    frame["age15_date"] = age15_date   # NaT = unknown birth date
     frame["fu_start"] = age15_date.where(age15_date > REGISTRY_START, REGISTRY_START)
     frame["fu_end"] = membership_end.fillna(STUDY_END).clip(upper=STUDY_END).values   # 2079-06-06 = active
 
@@ -796,9 +798,10 @@ def _diagnoser_match_mask(frame, outcome_list, raw_dates):
 # ~diagnoser_excluded_mask(...) for exactly this reason.
 def first_of(frame, outcome_list):
     raw_dates = first_of_raw(frame, outcome_list)
-    # a first-ever exposure before follow-up start (before age 15) is not an entry -- and since
-    # first_of_raw() still sees it, the patient is not "general" either: excluded from both
-    raw_dates = raw_dates.where(raw_dates >= frame["fu_start"])
+    # a first-ever exposure before age 15 is not an entry -- and since first_of_raw() still sees
+    # it, the patient is not "general" either: excluded from both. Compared to the 15th birthday
+    # only (not fu_start), so an exposure before 2017 at age 15+ stays an entry as before.
+    raw_dates = raw_dates.where(~(raw_dates < frame["age15_date"]))
     if CURRENT_DIAGNOSER_MODE == "any_diagnoser":
         return raw_dates
     keep = _diagnoser_match_mask(frame, outcome_list, raw_dates)
@@ -3165,7 +3168,10 @@ def desc_overview_page(pdf, frame, age_label):
                        (f"Exposed: {TRAUMA_EXPOSURE_LABEL} (any time)", exposed),
                        (f"  {TRAUMA_EXPOSURE_LABEL} before Oct 7", pre),
                        (f"  {TRAUMA_EXPOSURE_LABEL} on/after Oct 7", post),
-                       (f"General (never {TRAUMA_EXPOSURE_LABEL})", general)]:
+                       (f"General (never {TRAUMA_EXPOSURE_LABEL})", general),
+                       (f"Excluded ({TRAUMA_EXPOSURE_LABEL} before age 15"
+                        + ("" if CURRENT_DIAGNOSER_MODE == "any_diagnoser" else " / other diagnoser") + ")",
+                        ~exposed & ~general)]:
         sub = frame[mask]
         rows[name] = {"n patients": int(mask.sum()),
                       "% of age band": mask.mean() * 100,
@@ -3467,8 +3473,10 @@ def desc_statement3_pages(pdf, frame, age_label):
             if f"first_{item}" not in frame.columns:
                 continue
             d = frame.loc[m, f"first_{item}"]
-            r[f"{item}: new dx pre"] = int(((d >= REGISTRY_START) & (d < OCT7)).sum())
-            r[f"{item}: new dx post"] = int(((d >= OCT7) & (d <= STUDY_END)).sum())
+            # same rule as Statement 3: only diagnoses made during follow-up (from age 15 / 2017)
+            in_fu = (d >= frame.loc[m, "fu_start"]) & (d <= frame.loc[m, "fu_end"])
+            r[f"{item}: new dx pre"] = int((in_fu & (d < OCT7)).sum())
+            r[f"{item}: new dx post"] = int((in_fu & (d >= OCT7)).sum())
         rows[ZONE_LABELS[z]] = r
     df = pd.DataFrame(rows).T; df.index.name = "Zone"
     draw_table_page(pdf, f"DESCRIPTIVE | Slides 26-34 | zone sizes and raw counts of new diagnoses | {age_label}",
@@ -3690,10 +3698,10 @@ def _run_sanity_checks_body(frame_full, entry_meta_full, downstream_meta_full, o
     info(f"{TRAUMA_EXPOSURE_LABEL} patients diagnosed AFTER membership end (contribute 0 days)",
          f"{int((entry > frame.loc[entry.index, 'fu_end']).sum()):,} of {len(entry):,}")
     raw = first_of_raw(frame, TRAUMA_EXPOSURE_OUTCOMES)
-    info(f"{TRAUMA_EXPOSURE_LABEL} patients excluded (first diagnosis before age 15 / fu_start)",
-         f"{int((raw < frame['fu_start']).sum()):,} of {int(raw.notna().sum()):,}")
-    check("every exposed entry is on/after its patient's fu_start (age 15)",
-          bool((entry >= frame.loc[entry.index, "fu_start"]).all()))
+    info(f"{TRAUMA_EXPOSURE_LABEL} patients excluded (first diagnosis before age 15)",
+         f"{int((raw < frame['age15_date']).sum()):,} of {int(raw.notna().sum()):,}")
+    check("no exposed entry is before its patient's 15th birthday",
+          not bool((entry < frame.loc[entry.index, "age15_date"]).any()))
     info("patients whose follow-up starts after 2017 (turned 15 after 1.1.2017)",
          f"{int((frame['fu_start'] > REGISTRY_START).sum()):,}")
 
