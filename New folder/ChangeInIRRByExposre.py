@@ -1664,12 +1664,12 @@ def draw_time_to_second_dx_boxplot(ax, frame, downstream_outcome):
 # Three curves, mirroring the boxplots:
 #   1 (gray)        = trauma before Oct7, followed only UNTIL Oct7 (censored at Oct7)
 #   2 (red)         = trauma on/after Oct7
-#   3 (gray dashed) = trauma before Oct7, followed only FROM Oct7 -- delayed entry: each patient
+#   3 (blue dashed) = trauma before Oct7, followed only FROM Oct7 -- delayed entry: each patient
 #                     joins the risk set at their own time-since-trauma on Oct7 (left truncation)
-# Test: log-rank, curve 1 vs curve 2 (two-sided). Curve 3 is NOT tested.
+# One page per pair in KM_PAGES (1 vs 2, 2 vs 3, 1 vs 3), each with a two-sided log-rank test.
 KM_GROUP_STYLES = {1: ("#7f8c8d", "-",  "trauma before Oct7 (followed until Oct7)"),
                    2: ("#e63946", "-",  "trauma on/after Oct7"),
-                   3: ("#7f8c8d", "--", "trauma before Oct7 (followed from Oct7)")}
+                   3: ("#457b9d", "--", "trauma before Oct7 (followed from Oct7)")}
 
 
 def km_intervals(frame, downstream_outcome, group):
@@ -1749,8 +1749,9 @@ def logrank_test(a, b):
     return stats.chi2.sf(chi2, df=1)
 
 
-def draw_km_cumulative_incidence(ax, frame, downstream_outcome):
-    groups = {g: km_intervals(frame, downstream_outcome, g) for g in (1, 2, 3)}
+def draw_km_cumulative_incidence(ax, frame, downstream_outcome, curves=(1, 2)):
+    """Draws the two KM groups in `curves` (keys of KM_GROUP_STYLES) and log-rank tests them."""
+    groups = {g: km_intervals(frame, downstream_outcome, g) for g in curves}
     horizon = FIXED_WINDOW_DAYS
     for g, (t_enter, t_exit, is_event) in groups.items():
         color, ls, label = KM_GROUP_STYLES[g]
@@ -1759,11 +1760,12 @@ def draw_km_cumulative_incidence(ax, frame, downstream_outcome):
         times, cum, lo, hi = km_cumulative_incidence(t_enter, t_exit, is_event)
         months = times / 30.44
         ax.step(months, cum * 100, where="post", color=color, linestyle=ls, linewidth=1.8,
-               label=f"{label}: {cum[-1]*100:.2f}% [{lo[-1]*100:.2f}-{hi[-1]*100:.2f}] "
+               label=f"({g}) {label}: {cum[-1]*100:.2f}% [{lo[-1]*100:.2f}-{hi[-1]*100:.2f}] "
                      f"(n={len(t_exit):,}, events={int(is_event.sum()):,})")
         ax.fill_between(months, lo * 100, hi * 100, step="post", color=color, alpha=0.12)
 
-    p = logrank_test(groups[1], groups[2])
+    a, b = curves
+    p = logrank_test(groups[a], groups[b])
     p_str = f"{p:.3g}" if pd.notna(p) else "n/a"
 
     # number-at-risk row under the x-axis, every 6 months
@@ -1772,7 +1774,7 @@ def draw_km_cumulative_incidence(ax, frame, downstream_outcome):
     ax.set_xticks(ticks)
     ax.set_xlim(0, horizon_mo)
     tick_days = np.clip(ticks * 30.44, 0.5, horizon)   # 0.5: just after entry; cap at window end
-    for row, g in enumerate((1, 2, 3)):
+    for row, g in enumerate(curves):
         t_enter, t_exit, _ = groups[g]
         at_risk = risk_set_sizes(t_enter, t_exit, tick_days) if len(t_exit) else np.zeros(len(ticks))
         color, ls, _ = KM_GROUP_STYLES[g]
@@ -1788,11 +1790,18 @@ def draw_km_cumulative_incidence(ax, frame, downstream_outcome):
     ax.set_xlabel(f"Months since {TRAUMA_EXPOSURE_LABEL} diagnosis", fontsize=8)
     ax.set_ylabel(f"Cumulative incidence of 2nd diagnosis (%)", fontsize=8)
     ax.set_title(f"{downstream_outcome.upper()}\n"
-               f"log-rank (two-sided), curve 1 (gray) vs curve 2 (red): p={p_str}\n"
-               f"dashed curve 3 is NOT part of the test", fontsize=9, fontweight="bold")
+               f"log-rank (two-sided), curve {a} vs curve {b}: p={p_str}",
+               fontsize=9, fontweight="bold")
     ax.legend(fontsize=6.5, loc="upper left", title=f"% at {horizon//30}mo [95% CI]",
              title_fontsize=6.5)
     ax.grid(axis="y", alpha=0.3)
+
+
+# One KM page per pair of curves (see KM_GROUP_STYLES)
+KM_PAGES = [((1, 2), "PRE-war (until Oct7) vs POST-war trauma"),
+            ((2, 3), "POST-war trauma vs PRE-war trauma followed from Oct7"),
+            ((1, 3), "PRE-war trauma: follow-up before vs from Oct7 -- CAUTION: overlapping "
+                     "patients, log-rank assumes independent groups, p is approximate")]
 
 
 # --- Write the 2 min-n-filtered by-second-diagnosis-year pages, then the 3 boxplot pages
@@ -1839,19 +1848,22 @@ def write_statement1_min_n_and_boxplot_pages(pdf, frame, age_label):
     plt.tight_layout()
     pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
 
-    # patient-level page 2: cumulative incidence over ALL exposed patients (censoring-aware)
-    fig, axes = plt.subplots(1, 2, figsize=(14, 7.5))
-    fig.suptitle(f"STATEMENT 1 (supporting) | Cumulative incidence of 2nd diagnosis after "
-                f"{TRAUMA_EXPOSURE_LABEL}, PATIENT-LEVEL (1 - Kaplan-Meier) | {age_label}\n"
-                f"all exposed patients; follow-up ending without a 2nd dx (window / left Clalit / "
-                f"study end) is censored, not counted as 'no conversion'\n"
-                f"curve 3 = pre-Oct7 trauma patients still at risk on Oct7, followed from Oct7 "
-                f"(delayed entry); shaded = 95% CI",
-                fontsize=10, fontweight="bold")
-    for ax, outcome in zip(axes, FOCUS_OUTCOMES):
-        draw_km_cumulative_incidence(ax, frame, outcome)
-    plt.tight_layout()
-    pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+    # patient-level KM pages: cumulative incidence over ALL exposed patients (censoring-aware),
+    # one page per pair of curves in KM_PAGES
+    for curves, pair_label in KM_PAGES:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 7.5))
+        delayed_note = ("curve 3 = pre-Oct7 trauma patients still at risk on Oct7, followed from "
+                        "Oct7 (delayed entry); " if 3 in curves else "")
+        fig.suptitle(f"STATEMENT 1 (supporting) | Cumulative incidence of 2nd diagnosis after "
+                    f"{TRAUMA_EXPOSURE_LABEL}, PATIENT-LEVEL (1 - Kaplan-Meier) | {age_label}\n"
+                    f"{pair_label} | all exposed patients; follow-up ending without a 2nd dx "
+                    f"(window / left Clalit / study end) is censored\n"
+                    f"{delayed_note}shaded = 95% CI",
+                    fontsize=10, fontweight="bold")
+        for ax, outcome in zip(axes, FOCUS_OUTCOMES):
+            draw_km_cumulative_incidence(ax, frame, outcome, curves)
+        plt.tight_layout()
+        pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
 
 
 # --- T-Yearly-Forecast: quantitative version of "gradual decline vs sharp break" ---------------
