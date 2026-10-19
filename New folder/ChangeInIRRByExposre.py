@@ -2454,9 +2454,14 @@ def to_rate_per_1000_py(counts, person_years):
 
 
 # --- S3, STEP 3: Draw one quarterly per-1,000-by-zone panel ---
+# Zones drawn in Statement 3. Northern Border is left out on request -- its residents are simply
+# not shown (NOT merged into Rest of Israel), so the two remaining lines are unchanged.
+STATEMENT3_ZONES = ["Near Gaza", "Rest of Israel"]
+
+
 def draw_rate_panel(ax, rate_df, oct7_pos, title, subtitle=None):
     x = np.arange(len(rate_df.index))
-    for z in ZONE_ORDER:
+    for z in STATEMENT3_ZONES:
         if z in rate_df.columns:
             ax.plot(x, rate_df[z].values, marker="o", markersize=3.5,
                    linewidth=1.8, color=ZONE_COLORS[z], label=ZONE_LABELS[z])
@@ -2477,7 +2482,7 @@ def prepost_ratio_text(rate_df):
     post = [q for q in rate_df.index if q >= pd.Period("2023Q4", freq="Q")]
     ratio = rate_df.loc[post].mean() / rate_df.loc[pre].mean().replace(0, np.nan)
     return "post/pre rate ratio -> " + "  |  ".join(
-        f"{z}: x{ratio[z]:.2f}" for z in ZONE_ORDER if z in ratio.index)
+        f"{z}: x{ratio[z]:.2f}" for z in STATEMENT3_ZONES if z in ratio.index)
 
 
 # --- S3, STEP 4: Write Statement 3 pages (ROSE section, then DID-NOT-RISE section) ---
