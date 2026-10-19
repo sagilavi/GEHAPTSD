@@ -2369,6 +2369,205 @@ def write_statement2_extended(pdf, frame, age_label):
         plt.tight_layout(); pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
 
 
+# =============================================================================
+# COMORBIDITY -- risk of psychosis / bipolar when the patient has BOTH the trauma diagnosis and one
+# other diagnosis X, against: no trauma and no X / trauma only / X only. Appended at the end of
+# the presentation PDF (after Statement 2 extended) so earlier slide numbers don't move.
+#
+# Time-varying status, one comparison per (outcome, X). Each patient moves through statuses and
+# every stretch of person-time is counted in the status the patient was in at that time:
+#   none     : from fu_start (later of 2017 / age 15) until trauma, X, or fu_end -- no window
+#   trauma   : from the trauma date until the earliest of trauma + FIXED_WINDOW_DAYS, X, fu_end
+#   X only   : from the X date until the earliest of X + FIXED_WINDOW_DAYS, trauma, fu_end
+#   both     : from the later of the two dates (any order) until + FIXED_WINDOW_DAYS / fu_end
+# The outcome ends the stretch it falls in; an outcome on/before a stretch's start = prior case
+# (no person-time). A patient whose trauma or X falls before age 15 (or, in a diagnoser mode, was
+# not given by the matching diagnoser) is left out of that comparison, as in the rest of the file.
+# Before/after Oct 7 = by the date the patient ENTERED that status; "none" is always the whole
+# period (as the general population is on slides 2-3).
+# =============================================================================
+COMORB_STATES = ["none", "trauma", "x", "both"]
+COMORB_STATE_COLORS = {"none": "#b0b0b0", "trauma": "#e63946", "x": "#457b9d", "both": "#2b2d42"}
+
+
+def comorb_state_labels(x_label):
+    return {"none": f"no {TRAUMA_EXPOSURE_LABEL}, no {x_label}", "trauma": f"{TRAUMA_EXPOSURE_LABEL} only",
+            "x": f"{x_label} only", "both": f"{TRAUMA_EXPOSURE_LABEL} + {x_label}"}
+
+
+def comorb_x_list(outcome):
+    """The other diagnoses X paired with trauma for this outcome: (label, outcome key)."""
+    return [(label, outs[0]) for label, outs in current_alt_exposures_7().items()
+            if outs != TRAUMA_EXPOSURE_OUTCOMES and outs[0] != outcome]
+
+
+def comorbidity_segments(frame, outcome, x):
+    """One row per (patient, status) stretch with person-time: state, start, py, event."""
+    T, Tr = first_of(frame, TRAUMA_EXPOSURE_OUTCOMES), first_of_raw(frame, TRAUMA_EXPOSURE_OUTCOMES)
+    X, Xr = first_of(frame, [x]), first_of_raw(frame, [x])
+    keep = ~(Tr.notna() & T.isna()) & ~(Xr.notna() & X.isna())
+    T, X = T[keep], X[keep]
+    O, fu_start, cap = frame.loc[keep, f"first_{outcome}"], frame.loc[keep, "fu_start"], frame.loc[keep, "fu_end"]
+    win = pd.to_timedelta(FIXED_WINDOW_DAYS, unit="D")
+    earliest = lambda *cols: pd.concat(cols, axis=1).min(axis=1)   # skips NaT
+
+    starts = {"none": fu_start,
+              "trauma": T.where(T.notna() & (X.isna() | (X > T))),
+              "x": X.where(X.notna() & (T.isna() | (T > X))),
+              "both": pd.concat([T, X], axis=1).max(axis=1).where(T.notna() & X.notna())}
+    ends = {"none": earliest(T, X, cap),
+            "trauma": earliest(starts["trauma"] + win, X.where(X > T), cap),
+            "x": earliest(starts["x"] + win, T.where(T > X), cap),
+            "both": earliest(starts["both"] + win, cap)}
+    parts = []
+    for state in COMORB_STATES:
+        start, end = starts[state], ends[state]
+        ok = start.notna() & (end > start) & ~(O.notna() & (O <= start))
+        start, end, o = start[ok], end[ok], O[ok]
+        event = o.notna() & (o > start) & (o <= end)
+        if LAG_DAYS > 0:
+            event &= (o - start).dt.days >= LAG_DAYS
+        exit_ = end.where(~event, o)
+        parts.append(pd.DataFrame({"state": state, "start": start,
+                                   "py": (exit_ - start).dt.days / 365.25, "event": event}))
+    return pd.concat(parts, ignore_index=True)
+
+
+def comorbidity_rates(seg):
+    """Per state: events, person-years, rate /1,000 PY -- all years, and pre/post by entry date."""
+    out = {}
+    for side, mask in [("all", pd.Series(True, index=seg.index)), ("pre", seg["start"] < OCT7),
+                       ("post", seg["start"] >= OCT7)]:
+        for state in COMORB_STATES:
+            sub = seg[(seg["state"] == state) & (mask if state != "none" else True)]
+            ev, py = int(sub["event"].sum()), sub["py"].sum()
+            out[(side, state)] = {"events": ev, "py": py, "patients": len(sub),
+                                  "rate": ev / py * 1000 if py > 0 else np.nan}
+    return out
+
+
+def compute_comorbidity_tables(frame):
+    """{outcome: DataFrame indexed by X label} with rates per state and the 3 IRRs (both vs
+    none / trauma / x) for all years, pre, post, plus % change pre->post of each IRR."""
+    tables, details = {}, {}
+    for outcome in FOCUS_OUTCOMES:
+        rows = {}
+        for x_label, x in comorb_x_list(outcome):
+            r = comorbidity_rates(comorbidity_segments(frame, outcome, x))
+            details[(outcome, x_label)] = r
+            row = {}
+            for side in ["all", "pre", "post"]:
+                for ref in ["none", "trauma", "x"]:
+                    ref_rate = r[("all" if ref == "none" else side, ref)]["rate"]
+                    both_rate = r[(side, "both")]["rate"]
+                    row[f"{side}|{ref}"] = both_rate / ref_rate if ref_rate and ref_rate > 0 else np.nan
+            for ref in ["none", "trauma", "x"]:
+                a, b = row[f"pre|{ref}"], row[f"post|{ref}"]
+                row[f"change|{ref}"] = (b - a) / a * 100 if pd.notna(a) and a > 0 and pd.notna(b) else np.nan
+            row["n_both"] = r[("all", "both")]["patients"]
+            for side in ["all", "pre", "post"]:
+                row[f"{side}|ev"] = r[(side, "both")]["events"]   # comorbid events behind each IRR
+            rows[x_label] = row
+        tables[outcome] = pd.DataFrame(rows).T
+    return tables, details
+
+
+COMORB_REF_LABELS = {"none": "vs no trauma, no X", "trauma": "vs trauma only", "x": "vs X only"}
+
+
+def draw_comorb_heatmap(ax, table, side, title, vmax=None):
+    refs = ["none", "trauma", "x"]
+    vals = table[[f"{side}|{r}" for r in refs]].values.astype(float)
+    change = side == "change"
+    annot = np.full(vals.shape, "", dtype=object)
+    for i in range(vals.shape[0]):
+        ev = None if change else int(table[f"{side}|ev"].iloc[i])
+        for j in range(vals.shape[1]):
+            if not np.isnan(vals[i, j]):
+                # comorbid events under each IRR: few events = unstable IRR
+                annot[i, j] = f"{vals[i, j]:+.0f}%" if change else f"{vals[i, j]:.1f}\n({ev} events)"
+    if change:
+        cap = CHANGE_HEATMAP_COLOR_CAP
+        kw = dict(cmap="RdYlGn", vmin=-cap, vmax=cap, center=0,
+                  cbar_kws={"extend": "both", "label": f"% change, clipped at +-{cap}%"})
+    else:
+        kw = dict(cmap="YlOrRd", vmin=0, vmax=vmax, cbar_kws={"label": "IRR (comorbid / reference)"})
+    sns.heatmap(vals, annot=annot, fmt="", mask=np.isnan(vals), linewidths=0.5, linecolor="#dddddd",
+                xticklabels=[COMORB_REF_LABELS[r] for r in refs],
+                yticklabels=[f"{TRAUMA_EXPOSURE_LABEL} + {x}\n(n={int(n):,})" for x, n in zip(table.index, table["n_both"])],
+                ax=ax, annot_kws={"fontsize": 9}, **kw)
+    ax.tick_params(axis="x", labelsize=8, rotation=0)
+    ax.tick_params(axis="y", labelsize=7.5, rotation=0)
+    ax.set_title(title, fontsize=10, fontweight="bold")
+
+
+def draw_comorb_bar_panel(ax, r, outcome, x_label):
+    labels = comorb_state_labels(x_label)
+    vals = [r[("all", s)] for s in COMORB_STATES]
+    x = np.arange(len(COMORB_STATES))
+    bars = ax.bar(x, [v["rate"] if pd.notna(v["rate"]) else 0 for v in vals], width=0.6,
+                  color=[COMORB_STATE_COLORS[s] for s in COMORB_STATES], alpha=0.9)
+    for bar, v in zip(bars, vals):
+        rate_txt = f"{v['rate']:.1f}" if pd.notna(v["rate"]) else "n/a"
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                f"{rate_txt}\nevents={v['events']:,}\nPY={v['py']:,.0f}", ha="center", va="bottom", fontsize=7)
+    both = vals[3]["rate"]
+    irr = lambda ref: both / ref if pd.notna(both) and pd.notna(ref) and ref > 0 else np.nan
+    irr_txt = "  |  ".join(f"{name} {irr(vals[i]['rate']):.1f}" for i, name in
+                           [(0, "IRR vs none"), (1, "vs trauma only"), (2, f"vs {x_label} only")])
+    ax.set_xticks(x); ax.set_xticklabels([labels[s] for s in COMORB_STATES], fontsize=7.5, rotation=12)
+    ax.set_ylabel(f"{outcome.capitalize()} rate per 1,000 person-years", fontsize=8)
+    ax.set_ylim(0, max([v["rate"] for v in vals if pd.notna(v["rate"])] + [0]) * 1.3 or 1)
+    ax.set_title(f"{outcome.upper()} | {TRAUMA_EXPOSURE_LABEL} + {x_label}\n{irr_txt}",
+                 fontsize=9, fontweight="bold")
+
+
+def write_comorbidity_statement(pdf, frame, age_label):
+    tables, details = compute_comorbidity_tables(frame)
+    win = FIXED_WINDOW_DAYS // 30
+    head = f"COMORBIDITY | {TRAUMA_EXPOSURE_LABEL} + another diagnosis X"
+    note = ("each cell = rate in the comorbid status / rate in the reference status; statuses are "
+            f"time-varying (a patient counts in each status only while in it), {win}mo window from entry")
+
+    vmax = np.nanmax([tables[o][[f"all|{r}" for r in ["none", "trauma", "x"]]].values for o in FOCUS_OUTCOMES])
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6.5))
+    fig.suptitle(f"{head} | IRR, all years | {age_label}\n{note}", fontsize=11, fontweight="bold")
+    for ax, o in zip(axes, FOCUS_OUTCOMES):
+        draw_comorb_heatmap(ax, tables[o], "all", f"-> {o.upper()}", vmax=vmax)
+    plt.tight_layout(); pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+    vmax = np.nanmax([tables[o][[f"{s}|{r}" for s in ["pre", "post"] for r in ["none", "trauma", "x"]]].values
+                      for o in FOCUS_OUTCOMES])
+    fig, axes = plt.subplots(2, 2, figsize=(16, 11))
+    fig.suptitle(f"{head} | IRR by date of entering the status, before vs on/after Oct 7 | {age_label}\n"
+                 f"{note}; 'no trauma, no X' = whole period (same reference both sides); same color scale",
+                 fontsize=11, fontweight="bold")
+    for row, o in enumerate(FOCUS_OUTCOMES):
+        draw_comorb_heatmap(axes[row, 0], tables[o], "pre", f"-> {o.upper()} | BEFORE Oct 7", vmax=vmax)
+        draw_comorb_heatmap(axes[row, 1], tables[o], "post", f"-> {o.upper()} | ON/AFTER Oct 7", vmax=vmax)
+    plt.tight_layout(); pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6.5))
+    fig.suptitle(f"{head} | How much did each IRR change, pre- vs post-Oct7 | {age_label}\n"
+                 f"green = IRR increased after Oct 7, red = decreased (% change relative to the pre-Oct7 IRR)",
+                 fontsize=11, fontweight="bold")
+    for ax, o in zip(axes, FOCUS_OUTCOMES):
+        draw_comorb_heatmap(ax, tables[o], "change", f"-> {o.upper()}")
+    plt.tight_layout(); pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+    for o in FOCUS_OUTCOMES:
+        xs = list(tables[o].index)
+        for i in range(0, len(xs), 2):
+            fig, axes = plt.subplots(1, 2, figsize=(16, 6.5))
+            fig.suptitle(f"{head} | rates of the 4 statuses, all years, within {win}mo | {age_label}",
+                         fontsize=11, fontweight="bold")
+            for ax, x_label in zip(axes, xs[i:i + 2]):
+                draw_comorb_bar_panel(ax, details[(o, x_label)], o, x_label)
+            for ax in axes[len(xs[i:i + 2]):]:
+                ax.axis("off")
+            plt.tight_layout(); pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+
 def write_statement2(pdf, frame, age_label):
     fig, axes = plt.subplots(1, 2, figsize=(15, 6))
     fig.suptitle(f"STATEMENT 2 | Alternate entry-diagnosis IRR | within "
@@ -3721,6 +3920,8 @@ def export_all(frame_full, entry_meta_full, downstream_meta_full, outcome_profes
             write_statement6(pdf, frame, label)
             print("  Statement 2 (extended, appended at the end)...")
             write_statement2_extended(pdf, frame, label)
+            print("  Comorbidity (appended at the end)...")
+            write_comorbidity_statement(pdf, frame, label)
         print(f"  Saved: {output_pdf}")
         print("  Descriptive companion...")
         write_descriptive_pdf(output_pdf.replace(".pdf", "_descriptive.pdf"),
