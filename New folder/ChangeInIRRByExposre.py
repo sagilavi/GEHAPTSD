@@ -2228,6 +2228,147 @@ def draw_b1_prepost_change_heatmap(ax, change_matrix, title):
 
 
 # --- S2, STEP 4: Write Statement 2 pages (4 pages) for one age band ---
+# --- S2 EXTENDED: every entry diagnosis x every second diagnosis (7x7), plus the bar charts for
+# the second diagnoses slides 22/24 don't cover. Written at the END of the PDF (slides 43+) so
+# slides 1-42 keep their numbers. Same windowed person-time design as the rest of Statement 2.
+# The merged trauma diagnosis is also a SECOND diagnosis here: its first date as an outcome is
+# the earliest of its components (column first_trauma_dx, added on the fly). Diagonal = self-pair
+# (entry diagnosis == second diagnosis) and stays empty.
+TRAUMA_DX_KEY = "trauma_dx"
+
+
+def s2_targets_7(frame):
+    """(label, downstream key, component outcomes) for the 7 second diagnoses, trauma first."""
+    if f"first_{TRAUMA_DX_KEY}" not in frame.columns:
+        frame[f"first_{TRAUMA_DX_KEY}"] = first_of_raw(frame, TRAUMA_EXPOSURE_OUTCOMES)
+    return [(label, TRAUMA_DX_KEY if outcomes == TRAUMA_EXPOSURE_OUTCOMES else outcomes[0], outcomes)
+            for label, outcomes in current_alt_exposures_7().items()]
+
+
+def compute_s2_full_matrices(frame):
+    """Returns (overall, pre, post): DataFrames indexed by entry-diagnosis label, columns n_exp,
+    n_gen + one IRR column per downstream key. NaN on the diagonal (self-pair)."""
+    targets = s2_targets_7(frame)
+    overall, pre, post = [], [], []
+    for exp_label, exp_outcomes in current_alt_exposures_7().items():
+        downs = [key for _, key, comps in targets if comps != exp_outcomes]
+        n_exp, n_gen, comp = compute_exposed_vs_general(frame, exp_outcomes, downs)
+        row = {"exposure": exp_label, "n_exp": n_exp, "n_gen": n_gen}
+        row.update(dict(zip(comp["outcome"], comp["rr"])))
+        overall.append(row)
+        (n_pre, rr_pre), (n_post, rr_post), n_gen_pp = compute_prepost_window_rr(
+            frame, exp_outcomes, downs, FIXED_WINDOW_DAYS)
+        pre.append({"exposure": exp_label, "n_exp": n_pre, "n_gen": n_gen_pp, **rr_pre})
+        post.append({"exposure": exp_label, "n_exp": n_post, "n_gen": n_gen_pp, **rr_post})
+    keys = [key for _, key, _ in targets]
+    as_df = lambda rows: pd.DataFrame(rows).set_index("exposure").reindex(columns=["n_exp", "n_gen"] + keys)
+    return as_df(overall), as_df(pre), as_df(post)
+
+
+def draw_s2_full_heatmap(ax, matrix, targets, title, n_col="n_exp", change=False, vmax=None):
+    keys = [key for _, key, _ in targets]
+    vals = matrix[keys].values.astype(float)
+    annot = np.full(vals.shape, "", dtype=object)
+    for i in range(vals.shape[0]):
+        for j in range(vals.shape[1]):
+            if pd.notna(vals[i, j]):
+                annot[i, j] = f"{vals[i, j]:+.0f}%" if change else f"{vals[i, j]:.1f}"
+    if change:
+        row_labels = [f"{idx}\n(n_pre={int(a):,}, n_post={int(b):,})"
+                      for idx, a, b in zip(matrix.index, matrix["n_pre"], matrix["n_post"])]
+        cap = CHANGE_HEATMAP_COLOR_CAP
+        kw = dict(cmap="RdYlGn", vmin=-cap, vmax=cap, cbar_kws={"extend": "both", "label": f"clipped at +-{cap}%"})
+    else:
+        row_labels = [f"{idx}\n(n_exp={int(n):,})" for idx, n in zip(matrix.index, matrix[n_col])]
+        kw = dict(cmap="YlOrRd", vmin=0, vmax=vmax, cbar_kws={"label": f"IRR within {FIXED_WINDOW_DAYS//30}mo"})
+    sns.heatmap(vals, annot=annot, fmt="", mask=np.isnan(vals), linewidths=0.5, linecolor="#dddddd",
+                xticklabels=[label for label, _, _ in targets], yticklabels=row_labels, ax=ax,
+                annot_kws={"fontsize": 8}, **kw)
+    ax.set_xlabel("Second diagnosis (downstream)", fontsize=8)
+    ax.set_ylabel("Entry diagnosis", fontsize=8)
+    ax.tick_params(axis="x", labelsize=8, rotation=30)
+    ax.tick_params(axis="y", labelsize=7, rotation=0)
+    ax.set_title(title, fontsize=10, fontweight="bold")
+
+
+def draw_s2_overall_bar_panel(ax, overall, downstream_key, title):
+    """Slide-22 style: one bar per entry diagnosis, IRR for this second diagnosis."""
+    sub = overall[overall[downstream_key].notna()]
+    x = np.arange(len(sub))
+    bars = ax.bar(x, sub[downstream_key].values, width=0.6, alpha=0.85,
+                  color=[EXPOSURE_COLORS.get(l, "#888") for l in sub.index])
+    ax.axhline(1.0, color="black", linestyle="--", linewidth=1)
+    for bar, (label, row) in zip(bars, sub.iterrows()):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
+                f"RR {row[downstream_key]:.1f}\nn_exp={int(row['n_exp']):,}\nn_gen={int(row['n_gen']):,}",
+                ha="center", va="bottom", fontsize=6.5)
+    ax.set_xticks(x); ax.set_xticklabels(sub.index, rotation=20, ha="right", fontsize=8)
+    ax.set_ylabel("IRR (exposed / general), downstream after exposure", fontsize=8)
+    ax.set_title(title, fontsize=10, fontweight="bold")
+
+
+def write_statement2_extended(pdf, frame, age_label):
+    targets = s2_targets_7(frame)
+    overall, pre, post = compute_s2_full_matrices(frame)
+    win = FIXED_WINDOW_DAYS // 30
+
+    fig, ax = plt.subplots(figsize=(12, 7.5))
+    fig.suptitle(f"STATEMENT 2 (extended) | IRR, every entry diagnosis x every second diagnosis | "
+                 f"within {win}mo, all years | {age_label}\nrow = entry diagnosis, column = second "
+                 f"diagnosis; each row vs. its own general population (never had that entry dx)",
+                 fontsize=11, fontweight="bold")
+    draw_s2_full_heatmap(ax, overall, targets, "")
+    plt.tight_layout(); pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+    fig, axes = plt.subplots(1, 2, figsize=(20, 7.5))
+    fig.suptitle(f"STATEMENT 2 (extended) | IRR by entry diagnosis date, before vs on/after Oct 7 | "
+                 f"within {win}mo | {age_label}", fontsize=11, fontweight="bold")
+    keys = [key for _, key, _ in targets]
+    shared_vmax = np.nanmax(np.concatenate([pre[keys].values.ravel(), post[keys].values.ravel()]).astype(float))
+    draw_s2_full_heatmap(axes[0], pre, targets, "Entry diagnosed BEFORE Oct 7 2023 (same color scale)",
+                         vmax=shared_vmax)
+    draw_s2_full_heatmap(axes[1], post, targets, "Entry diagnosed ON/AFTER Oct 7 2023 (same color scale)",
+                         vmax=shared_vmax)
+    plt.tight_layout(); pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+    keys = [key for _, key, _ in targets]
+    change = pd.DataFrame(index=pre.index)
+    change["n_pre"], change["n_post"] = pre["n_exp"], post["n_exp"]
+    for k in keys:
+        change[k] = np.where(pre[k] > 0, (post[k] - pre[k]) / pre[k] * 100, np.nan)
+    fig, ax = plt.subplots(figsize=(12, 7.5))
+    fig.suptitle(f"STATEMENT 2 (extended) | How much did the IRR change, pre- vs post-Oct7 entry | "
+                 f"{age_label}\ngreen = IRR increased after Oct 7, red = decreased (% change "
+                 f"relative to the pre-Oct7 IRR)", fontsize=11, fontweight="bold")
+    draw_s2_full_heatmap(ax, change, targets, "", change=True)
+    plt.tight_layout(); pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+    # bar charts for the second diagnoses slides 22/24 don't show -- 2 per page
+    labels = {key: label for label, key, _ in targets}
+    remaining = [key for key in ["anxiety", "depression", "substance", "personality", TRAUMA_DX_KEY]
+                 if key in labels]
+    pages = [remaining[i:i + 2] for i in range(0, len(remaining), 2)]
+    for keys_on_page in pages:
+        fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+        fig.suptitle(f"STATEMENT 2 (extended) | Alternate entry-diagnosis IRR | within {win}mo, "
+                     f"restricted person-time | {age_label}", fontsize=11, fontweight="bold")
+        for ax, key in zip(axes, keys_on_page):
+            draw_s2_overall_bar_panel(ax, overall, key, labels[key].upper())
+        for ax in axes[len(keys_on_page):]:
+            ax.axis("off")
+        plt.tight_layout(); pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+    for keys_on_page in pages:
+        fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+        fig.suptitle(f"STATEMENT 2 (extended) | Entry diagnosis before vs on/after Oct 7 | "
+                     f"IRR within {win}mo | {age_label}", fontsize=11, fontweight="bold")
+        for ax, key in zip(axes, keys_on_page):
+            draw_b1_prepost_bar_panel(ax, pre.drop(index=pre.index[pre[key].isna() & post[key].isna()]),
+                                      post, key, labels[key].upper())
+        for ax in axes[len(keys_on_page):]:
+            ax.axis("off")
+        plt.tight_layout(); pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+
 def write_statement2(pdf, frame, age_label):
     fig, axes = plt.subplots(1, 2, figsize=(15, 6))
     fig.suptitle(f"STATEMENT 2 | Alternate entry-diagnosis IRR | within "
@@ -3573,6 +3714,8 @@ def export_all(frame_full, entry_meta_full, downstream_meta_full, outcome_profes
             write_statement5(pdf, outcome_profession_meta, label)
             print("  Statement 6...")
             write_statement6(pdf, frame, label)
+            print("  Statement 2 (extended, appended at the end)...")
+            write_statement2_extended(pdf, frame, label)
         print(f"  Saved: {output_pdf}")
         print("  Descriptive companion...")
         write_descriptive_pdf(output_pdf.replace(".pdf", "_descriptive.pdf"),
