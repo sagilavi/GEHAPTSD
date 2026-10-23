@@ -402,6 +402,17 @@ def person_time_events_and_years(entry_dates, event_dates, window_days=None, lag
     person-time then simply runs to the window/STUDY_END boundary as if no event had occurred
     (this script only has first-ever dates, not recurrences, so there is no later event to
     still count for them)."""
+    entry, end_time, is_event, _ = exposed_intervals(entry_dates, event_dates, window_days, lag_days)
+    days_at_risk = (end_time - entry).dt.days.clip(lower=0)
+    person_years = days_at_risk.sum() / 365.25
+    n_events = int(is_event.sum())
+    return n_events, person_years
+
+
+def exposed_intervals(entry_dates, event_dates, window_days=None, lag_days=LAG_DAYS):
+    """Per at-risk exposed patient: (entry, end_time, is_event, event) -- the at-risk interval
+    behind person_time_events_and_years(); also used by the adjusted Poisson model so both
+    count exactly the same person-time."""
     window_days = FIXED_WINDOW_DAYS if window_days is None else window_days
     valid = entry_dates.notna()
     entry = entry_dates[valid]
@@ -424,11 +435,7 @@ def person_time_events_and_years(entry_dates, event_dates, window_days=None, lag
     # person-time: up to the event (if counted) or up to the boundary otherwise
     end_time = pd.Series(boundary, index=entry.index)
     end_time = end_time.where(~is_event, event)   # counted-event rows end exactly at the event
-
-    days_at_risk = (end_time - entry).dt.days.clip(lower=0)
-    person_years = days_at_risk.sum() / 365.25
-    n_events = int(is_event.sum())
-    return n_events, person_years
+    return entry, end_time, is_event, event
 
 
 def person_time_rate(entry_dates, event_dates, window_days=None, lag_days=LAG_DAYS):
@@ -460,6 +467,23 @@ def person_time_rate(entry_dates, event_dates, window_days=None, lag_days=LAG_DA
 def compute_general_lexis_split(frame, exposure_outcomes, downstream_outcome, periods):
     """periods: list of (label, start, end) tuples, end exclusive. Returns a DataFrame indexed
     by label with columns n_events/person_years/rate (per 1,000 person-years)."""
+    gen_start, end_time, is_event, down = general_intervals(frame, exposure_outcomes, downstream_outcome)
+
+    rows = []
+    for label, p_start, p_end in periods:
+        seg_start = gen_start.clip(lower=p_start)
+        overlap_end = end_time.clip(upper=p_end)
+        days = (overlap_end - seg_start).dt.days.clip(lower=0)
+        person_years = (days / 365.25).sum()
+        n_events = int((is_event & (down >= p_start) & (down < p_end)).sum())
+        rate = (n_events / person_years * 1000) if person_years > 0 else np.nan
+        rows.append({"label": label, "n_events": n_events, "person_years": person_years, "rate": rate})
+    return pd.DataFrame(rows).set_index("label")
+
+
+def general_intervals(frame, exposure_outcomes, downstream_outcome):
+    """Per patient: (gen_start, end_time, is_event, down) -- the "general" tracking interval
+    behind compute_general_lexis_split(); also used by the adjusted Poisson model."""
     exposure_date = first_of_raw(frame, exposure_outcomes)
     down = frame[f"first_{downstream_outcome}"]
 
@@ -472,17 +496,7 @@ def compute_general_lexis_split(frame, exposure_outcomes, downstream_outcome, pe
     is_event = down.notna() & (down > gen_start) & (down <= boundary)
     end_time = boundary.where(~is_event, down)   # exit exactly at the event if it's counted
     end_time = end_time.where(~prevalent, gen_start)   # prevalent -> zero person-time
-
-    rows = []
-    for label, p_start, p_end in periods:
-        seg_start = gen_start.clip(lower=p_start)
-        overlap_end = end_time.clip(upper=p_end)
-        days = (overlap_end - seg_start).dt.days.clip(lower=0)
-        person_years = (days / 365.25).sum()
-        n_events = int((is_event & (down >= p_start) & (down < p_end)).sum())
-        rate = (n_events / person_years * 1000) if person_years > 0 else np.nan
-        rows.append({"label": label, "n_events": n_events, "person_years": person_years, "rate": rate})
-    return pd.DataFrame(rows).set_index("label")
+    return gen_start, end_time, is_event, down
 
 
 def periods_from_years(years):
@@ -633,7 +647,12 @@ def build_frame(df):
     })
     birth = pd.to_datetime(df["birth date"], errors="coerce")
     frame["age_at_oct7"] = (OCT7 - birth).dt.days / 365.25
+    frame["birth"] = birth.values   # attained age in the adjusted Poisson model
     frame["zone"] = assign_zone(df)
+    # raw Northern Border flag (zone gives Near Gaza priority, so it can't be read back from zone)
+    frame["is_north_border"] = (
+        df.get("demographics_2023-residency border", pd.Series(index=df.index))
+        .astype(str).str.strip() == "גבול הצפון").values
 
     # --- Demographic comparison fields (Statement 7) -- raw, not derived/recoded, since we
     # don't have a decoder for most of these (unlike profession) -- displayed as whatever
@@ -2619,33 +2638,33 @@ def zone_populations(frame):
 
 
 # --- S3, STEP 2: Quarterly first-ever counts per zone for one item ('total' = all 8) ---
-def quarterly_counts(frame, item):
+def quarterly_counts(frame, item, group_col="zone", groups=ZONE_ORDER):
     q_index = pd.period_range("2017Q1", "2026Q2", freq="Q")
     outcomes = ALL_OUTCOMES if item == "total" else [item]
     ev = pd.concat(
-        [frame[["zone", "fu_start", "fu_end", f"first_{o}"]].dropna(subset=[f"first_{o}"])
+        [frame[[group_col, "fu_start", "fu_end", f"first_{o}"]].dropna(subset=[f"first_{o}"])
               .rename(columns={f"first_{o}": "date"})
          for o in outcomes], ignore_index=True)
     # only diagnoses made while the patient was under follow-up (same window as the denominator)
     ev = ev[(ev["date"] >= ev["fu_start"]) & (ev["date"] <= ev["fu_end"])]
     ev["quarter"] = ev["date"].dt.to_period("Q")
     ev = ev[ev["quarter"].isin(q_index)]
-    return (ev.groupby(["quarter", "zone"]).size()
-           .unstack("zone").reindex(index=q_index, columns=ZONE_ORDER).fillna(0))
+    return (ev.groupby(["quarter", group_col]).size()
+           .unstack(group_col).reindex(index=q_index, columns=groups).fillna(0))
 
 
 # --- S3, STEP 2b: Person-years under follow-up per quarter per zone (the rate denominator) ---
 # Replaces a fixed zone headcount: a patient only counts toward a quarter for the days they
 # were actually members (and 15+, and in Israel) during it -- so a zone whose population grew
 # over the years no longer shows inflated early-year rates.
-def quarterly_person_years(frame, q_index):
+def quarterly_person_years(frame, q_index, group_col="zone", groups=ZONE_ORDER):
     rows = {}
     for q in q_index:
         seg_start = frame["fu_start"].clip(lower=q.start_time)
         seg_end   = frame["fu_end"].clip(upper=(q + 1).start_time)
         py = (seg_end - seg_start).dt.days.clip(lower=0) / 365.25
-        rows[q] = py.groupby(frame["zone"]).sum()
-    return pd.DataFrame(rows).T.reindex(index=q_index, columns=ZONE_ORDER).fillna(0)
+        rows[q] = py.groupby(frame[group_col]).sum()
+    return pd.DataFrame(rows).T.reindex(index=q_index, columns=groups).fillna(0)
 
 
 def to_rate_per_1000_py(counts, person_years):
@@ -2702,6 +2721,68 @@ def write_statement3(pdf, frame, age_label):
                             subtitle=prepost_ratio_text(rate))
             plt.tight_layout()
             pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+    write_statement3_by_distance(pdf, frame, age_label)
+
+
+# --- S3, STEP 5: Same rates, one line per DISTANCE-FROM-GAZA band instead of per zone --------
+# Northern Border residents are left out (not merged into a band), like the zone pages above.
+# Patients with no distance value are left out too. In a population file that is already cut
+# by distance (e.g. <=20 km), only the bands inside that range have lines.
+DIST_BANDS = [(0, 7, "0-7 km"), (7, 20, "7-20 km"), (20, 40, "20-40 km"),
+              (40, 80, "40-80 km"), (80, np.inf, "80+ km")]
+DIST_BAND_LABELS = [label for _, _, label in DIST_BANDS]
+DIST_BAND_COLORS = dict(zip(DIST_BAND_LABELS, ["#9d0208", "#e85d04", "#faa307", "#2a9d8f", "#264653"]))
+
+
+def distance_band(frame):
+    """Distance band per patient (lower bound exclusive, so exactly 20 km falls in 7-20 km,
+    matching the <=20 km population); NaN for Northern Border residents / no distance."""
+    band = pd.Series(np.nan, index=frame.index, dtype=object)
+    for lo, hi, label in DIST_BANDS:
+        band[(frame["distance_km"] > lo) & (frame["distance_km"] <= hi)] = label
+    band[frame["distance_km"] == 0] = DIST_BANDS[0][2]
+    band[frame["is_north_border"]] = np.nan
+    return band
+
+
+def write_statement3_by_distance(pdf, frame, age_label):
+    q_index = pd.period_range("2017Q1", "2026Q2", freq="Q")
+    oct7_pos = next(i for i, q in enumerate(q_index) if q == pd.Period("2023Q4", freq="Q"))
+    f = frame.assign(dist_band=distance_band(frame))
+    f = f[f["dist_band"].notna()]
+    person_years = quarterly_person_years(f, q_index, "dist_band", DIST_BAND_LABELS)
+    shown = [b for b in DIST_BAND_LABELS if person_years[b].sum() > 0]
+    year_ticks = [i for i, q in enumerate(q_index) if q.quarter == 1]
+
+    for section_label, items in [("ROSE AFTER OCT 7", STATEMENT3_ROSE),
+                                 ("DID NOT RISE", STATEMENT3_DID_NOT_RISE)]:
+        fig, axes = plt.subplots(3, 2, figsize=(15, 13))
+        fig.suptitle(f"STATEMENT 3 | {section_label} | by distance from Gaza (Northern Border "
+                     f"excluded) | New dx per 1,000 person-years | Quarterly | {age_label}",
+                     fontsize=11, fontweight="bold")
+        for ax, item in zip(axes.flat, items):
+            rate = to_rate_per_1000_py(
+                quarterly_counts(f, item, "dist_band", DIST_BAND_LABELS), person_years)
+            x = np.arange(len(q_index))
+            for b in shown:
+                ax.plot(x, rate[b].values, marker="o", markersize=2.5, linewidth=1.4,
+                        color=DIST_BAND_COLORS[b], label=b)
+            ax.axvline(oct7_pos - 0.5, color="black", linewidth=1.5)
+            ax.set_xticks(year_ticks)
+            ax.set_xticklabels([str(q_index[i].year) for i in year_ticks], fontsize=7)
+            pre, post = rate.iloc[:oct7_pos].mean(), rate.iloc[oct7_pos:].mean()
+            ratio = post / pre.replace(0, np.nan)
+            ax.set_xlabel("post/pre -> " + " | ".join(f"{b}: x{ratio[b]:.2f}" for b in shown
+                                                      if pd.notna(ratio[b])), fontsize=7)
+            ax.set_ylabel("per 1,000 person-years", fontsize=8)
+            ax.set_title("ALL 8 OUTCOMES" if item == "total" else item.upper(),
+                         fontsize=10, fontweight="bold")
+            ax.legend(fontsize=7, loc="upper left", ncol=3)
+        for ax in list(axes.flat)[len(items):]:
+            ax.axis("off")
+        plt.tight_layout()
+        pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
 
 
 # =============================================================================
@@ -3420,6 +3501,318 @@ def load_and_build(input_file):
 
 
 # =============================================================================
+# PART 8 -- ADJUSTED IRR: Poisson regression with log(person-years) as offset
+#
+# Every IRR above is CRUDE: exposed rate / general rate, nothing else taken into account. The two
+# groups also differ in age, sex, sector, SES and comorbidity, and if any of those affects the
+# outcome on its own, the crude IRR mixes the trauma effect with the group differences
+# (confounding). Here the SAME person-time as the crude IRR (exposed_intervals() /
+# general_intervals() -- same windows, membership end, age-15 rule, prevalent-case exclusion) is
+# fed into a Poisson regression:
+#   log(events) = log(person-years) + exposure + attained age + sex + sector + SES + Charlson
+# and exp(coefficient of exposure) = the ADJUSTED IRR: how much the exposure raises the rate
+# among patients who are otherwise similar on those factors.
+#   - Attained age: each stretch of person-time is split by the age the patient was at that time
+#     (5-year bands), so time spent at 22 counts as age 20-24 even if the patient is 40 at Oct 7.
+#   - Sex, sector, SES (5-level), Charlson (0/1/2/3+) are per-patient categories; a missing value
+#     is its own category. Each covariate's reference is its largest category (by person-years).
+#   - Region / zone is deliberately NOT in the model (on request); no calendar-year term either.
+#   - Fitted on AGGREGATED cells (exposure x age band x sex x sector x SES x Charlson: summed
+#     events and person-years) -- for a Poisson model this gives exactly the same estimates as
+#     the patient-level fit, at a fraction of the size. Fitted by IRLS in numpy (no statsmodels
+#     dependency); 95% CI = Wald, from the inverse Fisher information.
+#   - Crude IRR in these plots = the same model with the exposure term only -- it equals the
+#     crude IRR on the earlier slides exactly (sanity check 11b).
+#   - Patients with no birth date can't be given an attained age and are left out of the model.
+#   - CAVEAT: the Charlson score is "last until 2023" -- for some patients it was measured after
+#     their entry, so it may partly reflect consequences rather than only prior health.
+# =============================================================================
+ADJ_AGE_BANDS = [(a, a + 5, f"{a}-{a + 4}") for a in range(15, 65, 5)] + [(65, 200, "65+")]
+ADJ_COVARIATES = ["Sex", "Sector", "SES (5-level)", "Charlson"]
+ADJ_COLORS = {"crude": "#95a5a6", "adjusted": "#e63946"}
+
+
+def _as_category(series):
+    """Clean per-patient category: numbers like '3.0' -> '3', blanks/NaN -> 'missing'."""
+    s = series.astype(object)
+    num = pd.to_numeric(s, errors="coerce")
+    out = s.astype(str).str.strip()
+    is_int = num.notna() & (num == num.round())
+    out[is_int] = num[is_int].astype(int).astype(str)
+    out[s.isna() | out.isin(["", "nan", "None", "NaT"])] = "missing"
+    return out
+
+
+def adjustment_covariates(frame):
+    charlson = pd.cut(frame["charlson_score"], [-np.inf, 0, 1, 2, np.inf], labels=["0", "1", "2", "3+"])
+    return pd.DataFrame({
+        "Sex": _as_category(frame["gender"]),
+        "Sector": _as_category(frame["sector"]),
+        "SES (5-level)": _as_category(frame["ses_5level"]),
+        "Charlson": charlson.astype(object).where(charlson.notna(), "missing"),
+    }, index=frame.index)
+
+
+def _age_band_bounds(birth):
+    """[(label, band_start, band_end)] dates per patient (5-year bands; 365.25-day years, cut at
+    midnight -- at most a day off a true birthday, irrelevant at this scale, and whole days so the
+    bands add up to exactly the unsplit person-time). The first band starts at birth (nobody is at
+    risk before 15 anyway) and the last runs to age 150, so no person-time falls outside."""
+    def at_age(years):
+        return (birth + pd.to_timedelta(years * 365.25, unit="D")).dt.normalize()
+    bounds = []
+    for i, (lo, hi, label) in enumerate(ADJ_AGE_BANDS):
+        b_start = birth if i == 0 else at_age(lo)
+        bounds.append((label, b_start, at_age(min(hi, 150))))
+    return bounds
+
+
+def _aggregate_intervals(start, end, is_event, event, cell, bounds, exposure_label):
+    """Splits each [start, end) interval by attained-age band and sums events and person-years
+    per (covariate cell, age band). Returns a small DataFrame."""
+    idx = start.index
+    parts = []
+    for label, b_start, b_end in bounds:
+        b_start, b_end = b_start.reindex(idx), b_end.reindex(idx)
+        s = start.where(start > b_start, b_start)
+        e = end.where(end < b_end, b_end)
+        py = (e - s).dt.days.clip(lower=0).fillna(0) / 365.25
+        ev = (is_event & (event >= b_start) & (event < b_end)).astype(int)
+        keep = (py > 0) | (ev > 0)
+        if keep.any():
+            agg = pd.DataFrame({"cell": cell.reindex(idx)[keep].values, "py": py[keep].values,
+                                "events": ev[keep].values}).groupby("cell").sum()
+            agg["age"] = label
+            parts.append(agg.reset_index())
+    out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["cell", "py", "events", "age"])
+    out["exposure"] = exposure_label
+    return out
+
+
+def build_poisson_table(frame, exposure_outcomes, downstream_outcome):
+    """Aggregated person-time table for one exposure definition and one outcome. Exposed time is
+    labeled 'before Oct 7' / 'on/after Oct 7' by the date of entry (as in Statement 1); general
+    time is 'general'. Returns (table, n_no_birth)."""
+    has_birth = frame["birth"].notna()
+    f = frame[has_birth]
+    covs = adjustment_covariates(f)
+    cell = covs.groupby(ADJ_COVARIATES, sort=False).ngroup()
+    cell_values = covs.assign(cell=cell.values).drop_duplicates("cell").set_index("cell")
+    bounds = _age_band_bounds(f["birth"])
+    down = f[f"first_{downstream_outcome}"]
+
+    entry_all = first_of(f, exposure_outcomes)
+    parts = []
+    for label, entry in [("before Oct 7", entry_all.where(entry_all < OCT7)),
+                         ("on/after Oct 7", entry_all.where(entry_all >= OCT7))]:
+        e_start, e_end, e_is_event, e_event = exposed_intervals(entry, down)
+        parts.append(_aggregate_intervals(e_start, e_end, e_is_event, e_event, cell, bounds, label))
+    g_start, g_end, g_is_event, g_event = general_intervals(f, exposure_outcomes, downstream_outcome)
+    parts.append(_aggregate_intervals(g_start, g_end, g_is_event, g_event, cell, bounds, "general"))
+
+    table = pd.concat(parts, ignore_index=True)
+    table = table.groupby(["exposure", "age", "cell"], as_index=False)[["py", "events"]].sum()
+    table = table.join(cell_values, on="cell")
+    return table[table["py"] > 0].reset_index(drop=True), int((~has_birth).sum())
+
+
+def fit_poisson(table, exposure_col, covariates, exposure_ref="general"):
+    """Poisson GLM, log link, offset log(py), fitted by IRLS. `covariates` are categorical
+    columns of `table`, each coded against its largest category by person-years. Returns a
+    DataFrame of terms (term, group, level, irr, lo, hi, p) -- intercept excluded."""
+    cols, names = [np.ones(len(table))], [("Intercept", "", "")]
+    for col in [exposure_col] + covariates:
+        if col == exposure_col:
+            ref = exposure_ref
+        else:
+            ref = table.groupby(col)["py"].sum().idxmax()
+        for level in sorted(table[col].astype(str).unique()):
+            if level == str(ref):
+                continue
+            cols.append((table[col].astype(str) == level).astype(float).values)
+            names.append((f"{col}: {level}", col, level))
+    X = np.column_stack(cols)
+    y = table["events"].values.astype(float)
+    offset = np.log(table["py"].values)
+
+    beta = np.zeros(X.shape[1])
+    beta[0] = np.log(max(y.sum(), 0.5) / table["py"].sum())
+    for _ in range(100):
+        eta = np.clip(X @ beta + offset, -50, 50)
+        mu = np.exp(eta)
+        z = eta - offset + (y - mu) / mu
+        XtW = X.T * mu
+        beta_new = np.linalg.pinv(XtW @ X) @ (XtW @ z)
+        if np.max(np.abs(beta_new - beta)) < 1e-8:
+            beta = beta_new
+            break
+        beta = beta_new
+    mu = np.exp(np.clip(X @ beta + offset, -50, 50))
+    se = np.sqrt(np.clip(np.diag(np.linalg.pinv((X.T * mu) @ X)), 0, None))
+
+    rows = []
+    for (term, group, level), b, s in zip(names[1:], beta[1:], se[1:]):
+        level_events = table.loc[table[group].astype(str) == level, "events"].sum()
+        if level_events == 0:   # no events in this level -> estimate runs to 0, CI meaningless
+            rows.append({"term": term, "group": group, "level": level, "irr": np.nan,
+                         "lo": np.nan, "hi": np.nan, "p": np.nan, "events": 0})
+            continue
+        p = 2 * stats.norm.sf(abs(b / s)) if s > 0 else np.nan
+        rows.append({"term": term, "group": group, "level": level, "irr": np.exp(b),
+                     "lo": np.exp(b - 1.96 * s), "hi": np.exp(b + 1.96 * s), "p": p,
+                     "events": int(level_events)})
+    return pd.DataFrame(rows)
+
+
+def adjusted_irr_results(frame, exposure_outcomes, downstream_outcome):
+    """Crude and adjusted IRR for the exposure overall and split before / on-after Oct 7, plus
+    the full adjusted (overall) model's terms."""
+    table, n_no_birth = build_poisson_table(frame, exposure_outcomes, downstream_outcome)
+    pooled = table.assign(exposure=table["exposure"].where(table["exposure"] == "general", "exposed"))
+    out = {"n_no_birth": n_no_birth, "table": table}
+    for key, tbl in [("overall", pooled), ("prepost", table)]:
+        for kind, covs in [("crude", []), ("adjusted", ["age"] + ADJ_COVARIATES)]:
+            out[(key, kind)] = fit_poisson(tbl, "exposure", covs)
+    return out
+
+
+def _exposure_row(res, level):
+    r = res[res["level"] == level]
+    return r.iloc[0] if len(r) else None
+
+
+def rtl(text):
+    """Hebrew text for matplotlib (which draws right-to-left text reversed): python-bidi if it's
+    installed, otherwise a plain reversal (fine for the single-word category labels used here)."""
+    text = str(text)
+    if not any("֐" <= c <= "׿" for c in text):
+        return text
+    try:
+        from bidi.algorithm import get_display
+        return get_display(text)
+    except ImportError:
+        return text[::-1]
+
+
+FOREST_TICKS = [0.1, 0.25, 0.5, 1, 2, 4, 8, 16, 32]
+
+
+def draw_forest(ax, rows, title, xlabel="IRR (log scale), 95% CI"):
+    """rows: list of (label, irr, lo, hi, color) top to bottom; label-only rows (irr None) are
+    bold group headers. Value + CI printed in a column to the right of the plot."""
+    n = len(rows)
+    finite = [v for _, irr, lo, hi, _ in rows if irr is not None for v in (irr, lo, hi)
+              if v is not None and np.isfinite(v) and v > 0]
+    lo_lim = max(min(finite + [0.5]) / 1.2, 0.05)
+    hi_lim = min(max(finite + [2.0]) * 1.2, 50)
+    for i, (label, irr, lo, hi, color) in enumerate(rows):
+        yy = n - 1 - i
+        if irr is None:
+            continue
+        if pd.isna(irr):
+            ax.text(1.02, yy, "n/a (no events)", transform=ax.get_yaxis_transform(),
+                    fontsize=7, va="center", ha="left", color="gray")
+        else:
+            ax.plot([max(lo, lo_lim), min(hi, hi_lim)], [yy, yy], color=color, linewidth=1.6)
+            ax.plot(irr, yy, marker="s", color=color, markersize=6)
+            ax.text(1.02, yy, f"{irr:.2f} [{lo:.2f}-{hi:.2f}]", transform=ax.get_yaxis_transform(),
+                    fontsize=7, va="center", ha="left")
+    ax.axvline(1.0, color="black", linestyle="--", linewidth=1)
+    ax.set_xscale("log")
+    ax.set_xlim(lo_lim, hi_lim)
+    ticks = [t for t in FOREST_TICKS if lo_lim <= t <= hi_lim]
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([f"{t:g}" for t in ticks], fontsize=7)
+    ax.xaxis.set_minor_formatter(plt.NullFormatter())
+    ax.set_yticks(range(n))
+    ax.set_yticklabels([r[0] for r in rows][::-1], fontsize=7.5)
+    for tick, r in zip(ax.get_yticklabels(), rows[::-1]):
+        if r[1] is None:
+            tick.set_fontweight("bold")
+    ax.tick_params(axis="y", length=0)
+    ax.set_ylim(-0.7, n - 0.3)
+    ax.set_xlabel(xlabel, fontsize=8)
+    ax.set_title(title, fontsize=10, fontweight="bold")
+
+
+def write_adjusted_forest_pages(pdf, frame, age_label):
+    adj_note = (f"Adjusted for attained age (5-yr bands), sex, sector, SES (5-level), Charlson "
+                f"(0/1/2/3+) -- Poisson regression, offset log(person-years), 95% Wald CI. "
+                f"Same person-time as the crude IRR: within {FIXED_WINDOW_DAYS // 30}mo of entry, "
+                f"membership end, age 15+, prevalent cases excluded.")
+    results = {o: adjusted_irr_results(frame, TRAUMA_EXPOSURE_OUTCOMES, o) for o in FOCUS_OUTCOMES}
+
+    # --- page 1: trauma, crude vs adjusted, overall and before / after Oct 7 ---
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5.5))
+    fig.suptitle(f"ADJUSTED IRR | {TRAUMA_EXPOSURE_LABEL} vs general population | crude vs adjusted, "
+                 f"overall and by entry before / on-after Oct 7 | {age_label}\n{adj_note}",
+                 fontsize=9.5, fontweight="bold")
+    for ax, outcome in zip(axes, FOCUS_OUTCOMES):
+        res = results[outcome]
+        rows = []
+        for header, key, level in [(f"{TRAUMA_EXPOSURE_LABEL} (any time)", "overall", "exposed"),
+                                   (f"{TRAUMA_EXPOSURE_LABEL} before Oct 7", "prepost", "before Oct 7"),
+                                   (f"{TRAUMA_EXPOSURE_LABEL} on/after Oct 7", "prepost", "on/after Oct 7")]:
+            rows.append((header, None, None, None, None))
+            for kind in ["crude", "adjusted"]:
+                r = _exposure_row(res[(key, kind)], level)
+                rows.append((f"   {kind}",) + ((r["irr"], r["lo"], r["hi"]) if r is not None
+                                                else (np.nan, np.nan, np.nan)) + (ADJ_COLORS[kind],))
+        n_note = f" ({res['n_no_birth']:,} without birth date left out)" if res["n_no_birth"] else ""
+        draw_forest(ax, rows, f"-> {outcome.upper()}{n_note}")
+    plt.tight_layout(rect=[0, 0, 1, 0.9])
+    fig.subplots_adjust(wspace=0.55)
+    pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+    # --- page 2: every term of the adjusted overall model ---
+    fig, axes = plt.subplots(1, 2, figsize=(15, 13))
+    fig.suptitle(f"ADJUSTED IRR | full model, all covariates | {TRAUMA_EXPOSURE_LABEL} (any time) "
+                 f"vs general | {age_label}\nEach row = IRR of that level vs its reference "
+                 f"(the largest category), with all other terms held fixed.\n{adj_note}",
+                 fontsize=9.5, fontweight="bold")
+    for ax, outcome in zip(axes, FOCUS_OUTCOMES):
+        terms = results[outcome][("overall", "adjusted")]
+        table = results[outcome]["table"]
+        rows = []
+        for group in ["exposure", "age"] + ADJ_COVARIATES:
+            g = terms[terms["group"] == group]
+            if group == "exposure":
+                ref = "general"
+            else:
+                ref = table.groupby(group)["py"].sum().idxmax()
+            rows.append((f"{'Exposure' if group == 'exposure' else 'Attained age' if group == 'age' else group}"
+                         f"  (ref: {rtl(ref)})", None, None, None, None))
+            for r in g.itertuples():
+                rows.append((f"   {rtl(r.level)}", r.irr, r.lo, r.hi, ADJ_COLORS["adjusted"]))
+        draw_forest(ax, rows, f"-> {outcome.upper()}")
+    plt.tight_layout(rect=[0, 0, 1, 0.9])
+    fig.subplots_adjust(wspace=0.55)
+    pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+    # --- page 3: all 7 entry exposures (Statement 2), crude vs adjusted, one model each ---
+    fig, axes = plt.subplots(1, 2, figsize=(15, 8))
+    fig.suptitle(f"ADJUSTED IRR | all entry diagnoses (Statement 2), each vs its own general "
+                 f"population | crude vs adjusted | {age_label}\n{adj_note}",
+                 fontsize=9.5, fontweight="bold")
+    for ax, outcome in zip(axes, FOCUS_OUTCOMES):
+        rows = []
+        for exp_label, outcome_list in current_alt_exposures_7().items():
+            if outcome in outcome_list:
+                continue   # exposure == outcome; skip self-pair (as in B1)
+            res = adjusted_irr_results(frame, outcome_list, outcome) if outcome_list != TRAUMA_EXPOSURE_OUTCOMES \
+                else results[outcome]
+            rows.append((exp_label, None, None, None, None))
+            for kind in ["crude", "adjusted"]:
+                r = _exposure_row(res[("overall", kind)], "exposed")
+                rows.append((f"   {kind}",) + ((r["irr"], r["lo"], r["hi"]) if r is not None
+                                                else (np.nan, np.nan, np.nan)) + (ADJ_COLORS[kind],))
+        draw_forest(ax, rows, f"-> {outcome.upper()}")
+    plt.tight_layout(rect=[0, 0, 1, 0.9])
+    fig.subplots_adjust(wspace=0.55)
+    pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+
+# =============================================================================
 # DESCRIPTIVE COMPANION PDF -- written next to every presentation_summary_*.pdf as
 # presentation_summary_*_descriptive.pdf. No statistical tests: counts, person-years, follow-up,
 # distributions -- the raw material behind each slide, so every slide's numbers can be read in
@@ -3543,6 +3936,73 @@ def desc_overview_page(pdf, frame, age_label):
                          f"before vs after Oct 7 | {age_label}", mix_df,
                     note="A shift toward ASR after Oct 7 means the post-war exposed group is made of "
                          "more acute, often transient diagnoses -- relevant to every pre/post comparison.")
+
+
+DESC_AGE_BANDS = [(15, 25, "15-24"), (25, 35, "25-34"), (35, 45, "35-44"), (45, 55, "45-54"),
+                  (55, 65, "55-64"), (65, 200, "65+")]
+
+
+def desc_population_table_page(pdf, frame, age_label):
+    """'Table 1': the population behind the adjusted model, by group -- every covariate the model
+    adjusts for, n (% of column). Plus person-years / events actually entering the model."""
+    entry = first_of(frame, TRAUMA_EXPOSURE_OUTCOMES)
+    general = first_of_raw(frame, TRAUMA_EXPOSURE_OUTCOMES).isna()
+    groups = {"General population": general,
+              f"{TRAUMA_EXPOSURE_LABEL} before Oct 7": entry.notna() & (entry < OCT7),
+              f"{TRAUMA_EXPOSURE_LABEL} on/after Oct 7": entry.notna() & (entry >= OCT7)}
+    covs = adjustment_covariates(frame)
+    age_band = pd.Series("missing", index=frame.index, dtype=object)
+    for lo, hi, label in DESC_AGE_BANDS:
+        age_band[(frame["age_at_oct7"] >= lo) & (frame["age_at_oct7"] < hi)] = label
+    covs.insert(0, "Age at Oct 7", age_band)
+
+    rows = {}
+    rows[("", "n patients")] = {g: f"{int(m.sum()):,}" for g, m in groups.items()}
+    rows[("", "age at Oct 7, median [IQR]")] = {
+        g: (f"{frame.loc[m, 'age_at_oct7'].median():.1f} [{frame.loc[m, 'age_at_oct7'].quantile(.25):.1f}-"
+            f"{frame.loc[m, 'age_at_oct7'].quantile(.75):.1f}]" if m.any() else "-")
+        for g, m in groups.items()}
+    for var in covs.columns:
+        levels = covs[var].value_counts().index.tolist()
+        levels = [l for l in levels if l != "missing"] + (["missing"] if "missing" in levels else [])
+        if var == "Age at Oct 7":
+            levels = [l for _, _, l in DESC_AGE_BANDS if l in levels] + [l for l in levels if l == "missing"]
+        elif var in ("SES (5-level)", "Charlson"):   # ordinal -- in order, not by size
+            levels = sorted(l for l in levels if l != "missing") + [l for l in levels if l == "missing"]
+        for level in levels:
+            rows[(var, level)] = {g: (f"{int((covs.loc[m, var] == level).sum()):,} "
+                                      f"({(covs.loc[m, var] == level).mean() * 100:.1f}%)" if m.any() else "-")
+                                  for g, m in groups.items()}
+    df = pd.DataFrame(rows).T
+    df.index = [f"{a}: {rtl(b)}" if a else b for a, b in df.index]
+    df.index.name = "Characteristic"
+    draw_table_page(pdf, f"DESCRIPTIVE | Adjusted-IRR slides | the population used, by group | {age_label}",
+                    df, font_size=7,
+                    note=f"Patients counted by group as in Statement 1 (exposure = earliest {TRAUMA_EXPOSURE_LABEL}, "
+                         f"{CURRENT_DIAGNOSER_LABEL}). Patients diagnosed before Oct 7 and their pre-trauma time "
+                         f"also contribute to the general population's person-time in the model (dynamic "
+                         f"exposure) -- these columns count each patient once, by their own group. Sex, sector, "
+                         f"SES and Charlson are the model's covariates as coded there; age in the model is "
+                         f"ATTAINED age (age during each stretch of person-time), shown here as age at Oct 7.")
+
+    # person-years and events that actually enter the model, per exposure group and outcome
+    rows = {}
+    for outcome in FOCUS_OUTCOMES:
+        table, n_no_birth = build_poisson_table(frame, TRAUMA_EXPOSURE_OUTCOMES, outcome)
+        for grp in ["general", "before Oct 7", "on/after Oct 7"]:
+            t = table[table["exposure"] == grp]
+            py, ev = t["py"].sum(), t["events"].sum()
+            rows[f"{outcome.upper()} | {grp}"] = {
+                "person-years": py, "events": int(ev),
+                "crude rate / 1,000 PY": ev / py * 1000 if py > 0 else np.nan,
+                "patients left out (no birth date)": n_no_birth}
+    df = pd.DataFrame(rows).T
+    df.index.name = "Outcome | group"
+    draw_table_page(pdf, f"DESCRIPTIVE | Adjusted-IRR slides | person-years and events in the Poisson model "
+                         f"| {age_label}", df,
+                    note="Same person-time as the crude IRR slides (window, membership end, age 15+, prevalent "
+                         "cases excluded); 'general' includes the pre-exposure time of patients who are later "
+                         "exposed.")
 
 
 def desc_statement1_pages(pdf, frame, age_label):
@@ -3876,6 +4336,7 @@ def desc_statement6_page(pdf, frame, age_label):
 def write_descriptive_pdf(output_pdf, frame, entry_meta, outcome_profession_meta, age_label):
     with PdfPages(output_pdf) as pdf:
         desc_overview_page(pdf, frame, age_label)
+        desc_population_table_page(pdf, frame, age_label)
         desc_statement1_pages(pdf, frame, age_label)
         desc_old_method_tests_page(pdf, frame, entry_meta, age_label)
         desc_yearly_pages(pdf, frame, age_label)
@@ -3892,19 +4353,49 @@ def write_descriptive_pdf(output_pdf, frame, entry_meta, outcome_profession_meta
 # globals TRAUMA_EXPOSURE_OUTCOMES/LABEL, CURRENT_DIAGNOSER_MODE) -- call set_trauma_mode() /
 # set_diagnoser_mode() first, or use export_all_diagnoser_modes() below to run all 3 diagnoser
 # modes automatically for one trauma mode. ---
+# --- Population variants: the whole file re-run on a geographic sub-population (BOTH the exposed
+# and the general group are restricted -- every rate and IRR is computed inside that area only).
+# Distance = distance_to_gaza_km; patients with no distance value are in neither variant.
+# key -> (label for titles, file-name suffix, mask function or None for everyone)
+POPULATIONS = {
+    "all":             ("", "", None),
+    "gaza20km":        ("<=20 km from Gaza", "_gaza20km",
+                        lambda f: f["distance_km"] <= 20),
+    "over20km_nonorth": (">20 km from Gaza, no Northern Border", "_over20km_nonorth",
+                         lambda f: (f["distance_km"] > 20) & ~f["is_north_border"]),
+}
+EXTRA_POPULATIONS = ["gaza20km", "over20km_nonorth"]   # run for the SLIM combination only
+
+
+def apply_population(frame, entry_meta, downstream_meta, outcome_profession_meta, population_key):
+    mask_fn = POPULATIONS[population_key][2]
+    if mask_fn is None:
+        return frame, entry_meta, downstream_meta, outcome_profession_meta
+    mask = mask_fn(frame).fillna(False).astype(bool)
+    return (frame[mask].copy(),
+            {o: d.loc[mask].copy() for o, d in entry_meta.items()},
+            {o: d.loc[mask].copy() for o, d in downstream_meta.items()},
+            {o: d.loc[mask].copy() for o, d in outcome_profession_meta.items()})
+
+
 def export_all(frame_full, entry_meta_full, downstream_meta_full, outcome_profession_meta_full,
-               output_dir, file_suffix="", age_keys=None):
+               output_dir, file_suffix="", age_keys=None, population_key="all"):
     os.makedirs(output_dir, exist_ok=True)
+    pop_label, pop_suffix, _ = POPULATIONS[population_key]
     for age_key, (age_label, lo, hi) in AGE_BANDS.items():
         if age_keys is not None and age_key not in age_keys:
             continue
         frame, entry_meta, downstream_meta, outcome_profession_meta = apply_age(
             frame_full, entry_meta_full, downstream_meta_full, outcome_profession_meta_full, lo, hi)
+        frame, entry_meta, downstream_meta, outcome_profession_meta = apply_population(
+            frame, entry_meta, downstream_meta, outcome_profession_meta, population_key)
         label = (f"{age_label} | {CURRENT_DIAGNOSER_LABEL}"
                 if CURRENT_DIAGNOSER_MODE != "any_diagnoser" else age_label)
+        if pop_label:
+            label = f"{label} | {pop_label}"
         print(f"\n=== {age_label} | trauma={TRAUMA_EXPOSURE_LABEL} | window={FIXED_WINDOW_DAYS}d | "
-             f"diagnoser={CURRENT_DIAGNOSER_LABEL} | n={len(frame):,} ===")
-        output_pdf = os.path.join(output_dir, f"presentation_summary_{age_key}{file_suffix}.pdf")
+             f"diagnoser={CURRENT_DIAGNOSER_LABEL} | population={pop_label or 'all'} | n={len(frame):,} ===")
+        output_pdf = os.path.join(output_dir, f"presentation_summary_{age_key}{file_suffix}{pop_suffix}.pdf")
         with PdfPages(output_pdf) as pdf:
             print("  Statement 1...")
             write_statement1(pdf, frame, label)
@@ -3922,6 +4413,8 @@ def export_all(frame_full, entry_meta_full, downstream_meta_full, outcome_profes
             write_statement2_extended(pdf, frame, label)
             print("  Comorbidity (appended at the end)...")
             write_comorbidity_statement(pdf, frame, label)
+            print("  Adjusted IRR forest plots (appended at the end)...")
+            write_adjusted_forest_pages(pdf, frame, label)
         print(f"  Saved: {output_pdf}")
         print("  Descriptive companion...")
         write_descriptive_pdf(output_pdf.replace(".pdf", "_descriptive.pdf"),
@@ -4157,6 +4650,28 @@ def _run_sanity_checks_body(frame_full, entry_meta_full, downstream_meta_full, o
          n_pre_labels + n_post_labels == len(trend_pre_full),
          f"{n_pre_labels}+{n_post_labels} vs {len(trend_pre_full)} total periods")
 
+    # --- 11b. Adjusted-IRR model: its CRUDE IRR (exposure term only) must equal the crude IRR of
+    # Statement 1 exactly, on the same patients (those with a birth date) -- proves the model
+    # sees exactly the same events and person-years as every crude slide. ---
+    f_birth = frame[frame["birth"].notna()]
+    for outcome in FOCUS_OUTCOMES:
+        _, _, comp = compute_exposed_vs_general(f_birth, TRAUMA_EXPOSURE_OUTCOMES, [outcome])
+        res = adjusted_irr_results(f_birth, TRAUMA_EXPOSURE_OUTCOMES, outcome)
+        r = _exposure_row(res[("overall", "crude")], "exposed")
+        irr_model = r["irr"] if r is not None else np.nan
+        irr_crude = comp.iloc[0]["rr"]
+        # 0.1% tolerance: the slides' general rate drops an outcome dated exactly on STUDY_END
+        check(f"Poisson crude IRR == Statement 1 crude IRR (within 0.1%) [{outcome}]",
+              pd.notna(irr_model) and pd.notna(irr_crude) and abs(irr_model / irr_crude - 1) < 1e-3,
+              f"model={irr_model}, crude={irr_crude}")
+
+    # --- 11c. The two geographic population variants never share a patient ---
+    in_a = POPULATIONS["gaza20km"][2](frame).fillna(False)
+    in_b = POPULATIONS["over20km_nonorth"][2](frame).fillna(False)
+    check("<=20 km and >20 km-no-North populations are disjoint", not bool((in_a & in_b).any()),
+          f"<=20km={int(in_a.sum()):,}, >20km no North={int(in_b.sum()):,}, "
+          f"in neither={int((~in_a & ~in_b).sum()):,}")
+
     # --- 12. Informational only (data hypotheses, not code-correctness -- printed, not asserted) --
     for item in STATEMENT3_ROSE + STATEMENT3_DID_NOT_RISE:
         pass   # Statement 3's own charts already show post/pre ratios directly; nothing extra
@@ -4192,6 +4707,18 @@ def export_all_diagnoser_modes(input_file, output_dir, trauma_mode=None):
             export_all(frame_full, entry_meta_full, downstream_meta_full, outcome_profession_meta_full,
                       output_dir, file_suffix=f"_{trauma_mode}_{window_key}_{diagnoser_key}",
                       age_keys=age_keys)
+
+    # geographic sub-population files, for the SLIM combination (age15_40 / 24mo / any diagnoser):
+    #   presentation_summary_age15_40_<trauma>_24mo_any_diagnoser_gaza20km.pdf
+    #   presentation_summary_age15_40_<trauma>_24mo_any_diagnoser_over20km_nonorth.pdf
+    # (+ a _descriptive.pdf next to each)
+    set_window_mode(SLIM_WINDOW)
+    set_diagnoser_mode(SLIM_DIAGNOSER, outcome_profession_meta_full)
+    for population_key in EXTRA_POPULATIONS:
+        print(f"\n{'-'*70}\nPOPULATION: {POPULATIONS[population_key][0]}\n{'-'*70}")
+        export_all(frame_full, entry_meta_full, downstream_meta_full, outcome_profession_meta_full,
+                  output_dir, file_suffix=f"_{trauma_mode}_{SLIM_WINDOW}_{SLIM_DIAGNOSER}",
+                  age_keys=[SLIM_AGE_BAND], population_key=population_key)
 
     if SLIM_RUN:
         run_sanity_checks(frame_full, entry_meta_full, downstream_meta_full, outcome_profession_meta_full)
