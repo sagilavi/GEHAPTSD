@@ -3616,10 +3616,9 @@ def build_poisson_table(frame, exposure_outcomes, downstream_outcome):
     return table[table["py"] > 0].reset_index(drop=True), int((~has_birth).sum())
 
 
-def fit_poisson(table, exposure_col, covariates, exposure_ref="general"):
-    """Poisson GLM, log link, offset log(py), fitted by IRLS. `covariates` are categorical
-    columns of `table`, each coded against its largest category by person-years. Returns a
-    DataFrame of terms (term, group, level, irr, lo, hi, p) -- intercept excluded."""
+def _poisson_design(table, exposure_col, covariates, exposure_ref):
+    """Intercept + dummy columns: the exposure against `exposure_ref`, each covariate against its
+    largest category by person-years. Returns (columns, [(term, group, level)])."""
     cols, names = [np.ones(len(table))], [("Intercept", "", "")]
     for col in [exposure_col] + covariates:
         if col == exposure_col:
@@ -3631,12 +3630,14 @@ def fit_poisson(table, exposure_col, covariates, exposure_ref="general"):
                 continue
             cols.append((table[col].astype(str) == level).astype(float).values)
             names.append((f"{col}: {level}", col, level))
-    X = np.column_stack(cols)
-    y = table["events"].values.astype(float)
-    offset = np.log(table["py"].values)
+    return cols, names
 
+
+def _irls(X, y, offset):
+    """Poisson GLM (log link) by IRLS. Returns (beta, covariance, log-likelihood without the
+    constant log(y!) term -- fine for likelihood-ratio tests between nested models)."""
     beta = np.zeros(X.shape[1])
-    beta[0] = np.log(max(y.sum(), 0.5) / table["py"].sum())
+    beta[0] = np.log(max(y.sum(), 0.5) / np.exp(offset).sum())
     for _ in range(100):
         eta = np.clip(X @ beta + offset, -50, 50)
         mu = np.exp(eta)
@@ -3648,7 +3649,20 @@ def fit_poisson(table, exposure_col, covariates, exposure_ref="general"):
             break
         beta = beta_new
     mu = np.exp(np.clip(X @ beta + offset, -50, 50))
-    se = np.sqrt(np.clip(np.diag(np.linalg.pinv((X.T * mu) @ X)), 0, None))
+    cov = np.linalg.pinv((X.T * mu) @ X)
+    loglik = float(np.sum(y * np.log(np.clip(mu, 1e-300, None)) - mu))
+    return beta, cov, loglik
+
+
+def fit_poisson(table, exposure_col, covariates, exposure_ref="general"):
+    """Poisson GLM, log link, offset log(py), fitted by IRLS. `covariates` are categorical
+    columns of `table`, each coded against its largest category by person-years. Returns a
+    DataFrame of terms (term, group, level, irr, lo, hi, p) -- intercept excluded."""
+    cols, names = _poisson_design(table, exposure_col, covariates, exposure_ref)
+    X = np.column_stack(cols)
+    y = table["events"].values.astype(float)
+    beta, cov, _ = _irls(X, y, np.log(table["py"].values))
+    se = np.sqrt(np.clip(np.diag(cov), 0, None))
 
     rows = []
     for (term, group, level), b, s in zip(names[1:], beta[1:], se[1:]):
@@ -3810,6 +3824,231 @@ def write_adjusted_forest_pages(pdf, frame, age_label):
     plt.tight_layout(rect=[0, 0, 1, 0.9])
     fig.subplots_adjust(wspace=0.55)
     pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+
+# =============================================================================
+# PART 9 -- ERA COMPARISON: X diagnosed BEFORE vs ON/AFTER Oct 7 (reviewer's design)
+#   - X = the trauma exposure (TRAUMA_EXPOSURE_OUTCOMES), Y = every other outcome.
+#   - Cohort: patients whose first-ever X is dated from REGISTRY_START (2017) on, at age 15+
+#     (first_of() -- the diagnoser mode applies). Pre era = X before Oct 7, post = on/after.
+#   - Person-time from X until the earliest of: Y, X + FIXED_WINDOW_DAYS (the lag cap, same in
+#     both eras), leaving Clalit, STUDY_END -- and for the pre era also the end of the era: pre
+#     time and events stop at Oct 7 (censored at Oct 6, 2023). Prevalent Y (on/before X) excluded.
+#   - Model: Poisson, offset log(person-years): era (ref = pre) + age AT X (not at Oct 7 -- the
+#     pre group was diagnosed years earlier, so age at Oct 7 is shifted by design) + sex + sector
+#     + SES + Charlson. Every covariate is in the model regardless of its SMD.
+#   - Subgroups: an era x subgroup interaction is added to the adjusted model (the subgroup's
+#     main effect too, if it isn't a confounder already). IRR in each level = exp(b_era +
+#     b_era x level); interaction p = likelihood-ratio test against the same model without it.
+#   - Table 1 / love plot: SMD pre vs post per covariate level (|SMD| > 0.1 = imbalance worth
+#     noting). The SMD describes the imbalance -- it does not choose the confounders.
+# =============================================================================
+ERA_AGE_BANDS = [(15, 25, "15-24"), (25, 35, "25-34"), (35, 45, "35-44"), (45, 65, "45-64"),
+                 (65, 200, "65+")]
+ERA_COVARIATES = ["Age at X"] + ADJ_COVARIATES
+ERA_SUBGROUPS = ["Sex", "Sector", "Age at X", "Distance from Gaza"]
+ERA_COLORS = {"crude": ADJ_COLORS["crude"], "adjusted": ADJ_COLORS["adjusted"], "subgroup": "#457b9d"}
+SMD_THRESHOLD = 0.1
+
+
+def era_outcomes():
+    """Y = every outcome that isn't part of the current trauma exposure."""
+    return [o for o in ALL_OUTCOMES if o not in TRAUMA_EXPOSURE_OUTCOMES]
+
+
+def era_cohort(frame):
+    """One row per patient with an incident X from 2017 on: entry, era, age at X (years and band),
+    the confounders and the distance subgroup."""
+    entry = first_of(frame, TRAUMA_EXPOSURE_OUTCOMES)
+    entry = entry[entry >= REGISTRY_START]
+    f = frame.loc[entry.index]
+    age_x = (entry - f["birth"]).dt.days / 365.25
+    age_band = pd.Series("missing", index=entry.index, dtype=object)
+    for lo, hi, label in ERA_AGE_BANDS:
+        age_band[(age_x >= lo) & (age_x < hi)] = label
+    distance = pd.Series("missing", index=entry.index, dtype=object)
+    distance[f["distance_km"] <= 20] = "<=20 km"
+    distance[f["distance_km"] > 20] = ">20 km (not North)"
+    distance[f["is_north_border"].astype(bool)] = "Northern Border"
+    cohort = adjustment_covariates(f)
+    cohort.insert(0, "Age at X", age_band)
+    cohort["Distance from Gaza"] = distance
+    cohort["entry"] = entry
+    cohort["era"] = np.where(entry < OCT7, "pre", "post")
+    cohort["age_x"] = age_x
+    return cohort
+
+
+def era_person_time(cohort, frame, outcome):
+    """Per at-risk cohort patient for Y = `outcome` (prevalent Y removed): py, events, covariates.
+    Same interval as the exposed side everywhere else (exposed_intervals), plus the pre-era cut."""
+    start, end, is_event, event = exposed_intervals(cohort["entry"], frame[f"first_{outcome}"])
+    pre = cohort.loc[start.index, "era"] == "pre"
+    is_event = is_event & ~(pre & (event >= OCT7))
+    end = end.where(~(pre & (end > OCT7)), OCT7)
+    py = (end - start).dt.days.clip(lower=0) / 365.25
+    return cohort.drop(columns=["entry"]).loc[start.index].assign(py=py, events=is_event.astype(int))
+
+
+def _era_fit(cells, covariates, subgroup=None):
+    """Poisson fit of era (ref = pre) + covariates [+ era x subgroup]. Returns (rows, loglik,
+    rank): rows = one era IRR (post vs pre) overall, or one per subgroup level."""
+    covariates = list(covariates)
+    if subgroup and subgroup not in covariates:
+        covariates.append(subgroup)
+    cols, names = _poisson_design(cells, "era", covariates, "pre")
+    post = (cells["era"] == "post").values.astype(float)
+    levels = [None]
+    if subgroup:
+        ref = str(cells.groupby(subgroup)["py"].sum().idxmax())
+        levels = [ref] + [l for l in sorted(cells[subgroup].astype(str).unique()) if l != ref]
+        cols += [post * (cells[subgroup].astype(str) == l).values for l in levels[1:]]
+    X = np.column_stack(cols)
+    beta, cov, loglik = _irls(X, cells["events"].values.astype(float), np.log(cells["py"].values))
+
+    rows = []
+    for k, level in enumerate(levels):
+        sub = cells if level is None else cells[cells[subgroup].astype(str) == level]
+        ev = sub.groupby("era")["events"].sum().reindex(["pre", "post"], fill_value=0)
+        py = sub.groupby("era")["py"].sum().reindex(["pre", "post"], fill_value=0)
+        row = {"level": level, "events_pre": int(ev["pre"]), "events_post": int(ev["post"]),
+               "py_pre": py["pre"], "py_post": py["post"],
+               "irr": np.nan, "lo": np.nan, "hi": np.nan, "p": np.nan}
+        if ev["pre"] > 0 and ev["post"] > 0:   # an era with no events -> IRR runs to 0 / inf
+            if k == 0:
+                b, v = beta[1], cov[1, 1]   # column 1 = "era: post"
+            else:
+                m = len(names) + k - 1
+                b, v = beta[1] + beta[m], cov[1, 1] + cov[m, m] + 2 * cov[1, m]
+            se = np.sqrt(max(v, 0))
+            row.update(irr=np.exp(b), lo=np.exp(b - 1.96 * se), hi=np.exp(b + 1.96 * se),
+                       p=2 * stats.norm.sf(abs(b / se)) if se > 0 else np.nan)
+        rows.append(row)
+    return rows, loglik, np.linalg.matrix_rank(X)
+
+
+def era_results(frame, cohort, outcome):
+    """Crude + adjusted era IRR and the subgroup interaction fits for one X -> Y pair. None if
+    nobody is at risk."""
+    pt = era_person_time(cohort, frame, outcome)
+    cells = pt.groupby(["era"] + ERA_COVARIATES + ["Distance from Gaza"], as_index=False)[["py", "events"]].sum()
+    cells = cells[cells["py"] > 0].reset_index(drop=True)
+    if cells.empty or cells["era"].nunique() < 2:
+        return None
+    out = {"pt": pt, "crude": _era_fit(cells, [])[0][0],
+           "adjusted": _era_fit(cells, ERA_COVARIATES)[0][0], "subgroups": {}}
+    for sg in ERA_SUBGROUPS:
+        covs = ERA_COVARIATES if sg in ERA_COVARIATES else ERA_COVARIATES + [sg]
+        _, ll0, rank0 = _era_fit(cells, covs)
+        rows, ll1, rank1 = _era_fit(cells, covs, sg)
+        p_int = stats.chi2.sf(max(2 * (ll1 - ll0), 0), rank1 - rank0) if rank1 > rank0 else np.nan
+        out["subgroups"][sg] = (rows, p_int)
+    return out
+
+
+def smd_rows(cohort):
+    """Table-1 rows pre vs post: age at X as a mean, then every level of each covariate as
+    n (%) with its SMD (post - pre). The distance subgroup is listed too (it isn't a confounder)."""
+    pre, post = cohort[cohort["era"] == "pre"], cohort[cohort["era"] == "post"]
+    rows = []
+    a, b = pre["age_x"].dropna(), post["age_x"].dropna()
+    sd = np.sqrt((a.var() + b.var()) / 2) if len(a) > 1 and len(b) > 1 else np.nan
+    rows.append(("Age at X (years)", "mean (SD)", f"{a.mean():.1f} ({a.std():.1f})",
+                 f"{b.mean():.1f} ({b.std():.1f})", (b.mean() - a.mean()) / sd if sd > 0 else np.nan))
+    for cov in ERA_COVARIATES + ["Distance from Gaza"]:
+        for level in sorted(cohort[cov].astype(str).unique()):
+            n1, n2 = int((pre[cov] == level).sum()), int((post[cov] == level).sum())
+            p1, p2 = n1 / max(len(pre), 1), n2 / max(len(post), 1)
+            v = (p1 * (1 - p1) + p2 * (1 - p2)) / 2
+            rows.append((cov, level, f"{n1:,} ({p1:.1%})", f"{n2:,} ({p2:.1%})",
+                         (p2 - p1) / np.sqrt(v) if v > 0 else np.nan))
+    return pd.DataFrame(rows, columns=["Covariate", "Level", "pre", "post", "SMD"])
+
+
+def _fmt_p(p):
+    return "n/a" if pd.isna(p) else "<0.001" if p < 0.001 else f"{p:.3f}"
+
+
+def _fmt_irr(r):
+    if pd.isna(r["irr"]):
+        return "n/a (an era has no events)"
+    return f"{r['irr']:.2f} [{r['lo']:.2f}-{r['hi']:.2f}], p = {_fmt_p(r['p'])}"
+
+
+def write_era_pages(pdf, frame, age_label):
+    x_label = TRAUMA_EXPOSURE_LABEL
+    cap = f"{FIXED_WINDOW_DAYS // 30}mo"
+    design_note = (f"Cohort: first-ever {x_label} from 2017 at age 15+. Person-time from {x_label} to the "
+                   f"earliest of Y, {cap} after {x_label}, leaving Clalit, 30.6.2026; pre era also "
+                   f"censored at 6.10.2023. Prevalent Y excluded.")
+    adj_note = ("Adjusted: age at X (" + "/".join(l for _, _, l in ERA_AGE_BANDS) + "), sex, sector, "
+                "SES (5-level), Charlson (0/1/2/3+). Poisson, offset log(person-years), 95% Wald CI.")
+    cohort = era_cohort(frame)
+    n_pre, n_post = int((cohort["era"] == "pre").sum()), int((cohort["era"] == "post").sum())
+    if n_pre == 0 or n_post == 0:
+        print(f"  Era comparison skipped: pre={n_pre:,}, post={n_post:,} patients")
+        return
+
+    # --- Table 1: the whole X cohort, pre vs post ---
+    t1 = smd_rows(cohort)
+    t1["Level"] = t1["Level"].map(rtl)
+    t1["SMD"] = t1["SMD"].map(lambda s: "-" if pd.isna(s) else f"{s:+.3f}" + (" *" if abs(s) > SMD_THRESHOLD else ""))
+    t1 = t1.rename(columns={"pre": f"Pre Oct 7 (n={n_pre:,})", "post": f"Post Oct 7 (n={n_post:,})"})
+    draw_table_page(pdf, f"ERA COMPARISON | Table 1 | {x_label} diagnosed before vs on/after Oct 7 | "
+                         f"{age_label}", t1.set_index("Covariate"),
+                    note=(f"SMD = standardized mean difference, post - pre (* = |SMD| > {SMD_THRESHOLD}: an "
+                          f"imbalance worth noting).\nEvery confounder enters the adjusted model regardless of "
+                          f"its SMD; 'Distance from Gaza' is a subgroup only, not adjusted for.\n{design_note}"),
+                    font_size=7)
+
+    for outcome in era_outcomes():
+        res = era_results(frame, cohort, outcome)
+        pair = f"{x_label} -> {outcome.upper()}"
+        if res is None:
+            print(f"  Era comparison {pair}: nobody at risk, skipped")
+            continue
+        crude, adjusted = res["crude"], res["adjusted"]
+        counts = (f"pre: {crude['events_pre']:,} events / {crude['py_pre']:,.0f} PY, "
+                  f"post: {crude['events_post']:,} events / {crude['py_post']:,.0f} PY")
+
+        # --- love plot: SMD per covariate level, in this pair's at-risk cohort ---
+        smd = smd_rows(res["pt"])
+        smd = smd[smd["Covariate"] != "Distance from Gaza"].iloc[::-1].reset_index(drop=True)
+        labels = [f"{c}: {rtl(l)}" if l != "mean (SD)" else c for c, l in zip(smd["Covariate"], smd["Level"])]
+        fig, ax = plt.subplots(figsize=(11, 0.28 * len(smd) + 2.2))
+        abs_smd = smd["SMD"].abs()
+        colors = np.where(abs_smd > SMD_THRESHOLD, "#e63946", "#2a9d8f")
+        ax.hlines(range(len(smd)), 0, abs_smd.fillna(0), color="#dddddd", linewidth=1)
+        ax.scatter(abs_smd, range(len(smd)), c=colors, s=30, zorder=3)
+        ax.axvline(SMD_THRESHOLD, color="black", linestyle="--", linewidth=1)
+        ax.set_yticks(range(len(smd)))
+        ax.set_yticklabels(labels, fontsize=7.5)
+        ax.set_xlim(0, max(abs_smd.max() * 1.15 if abs_smd.notna().any() else 0, 0.25))
+        ax.set_xlabel("|SMD| pre vs post Oct 7 (dashed line = 0.1)", fontsize=8)
+        ax.set_title(f"LOVE PLOT | {pair} | {age_label}\nCrude IRR post vs pre: {_fmt_irr(crude)}\n"
+                     f"{counts}\n{design_note}", fontsize=8.5, fontweight="bold", loc="left")
+        plt.tight_layout()
+        pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+        # --- forest: adjusted IRR overall and per subgroup level, with the interaction p ---
+        rows = [("Overall", None, None, None, None)]
+        for kind, r in [("crude", crude), ("adjusted", adjusted)]:
+            rows.append((f"   {kind}", r["irr"], r["lo"], r["hi"], ERA_COLORS[kind]))
+        for sg, (sg_rows, p_int) in res["subgroups"].items():
+            rows.append((f"{sg}  (interaction p = {_fmt_p(p_int)})", None, None, None, None))
+            for r in sorted(sg_rows, key=lambda r: r["level"]):
+                rows.append((f"   {rtl(r['level'])}  ({r['events_pre']:,} / {r['events_post']:,} events)",
+                             r["irr"], r["lo"], r["hi"], ERA_COLORS["subgroup"]))
+        fig, ax = plt.subplots(figsize=(11, 0.3 * len(rows) + 2.2))
+        draw_forest(ax, rows, "", xlabel="Adjusted IRR post vs pre Oct 7 (log scale), 95% CI")
+        ax.set_title(f"FOREST | {pair} | adjusted IRR post vs pre Oct 7, overall and per subgroup | "
+                     f"{age_label}\nAdjusted IRR: {_fmt_irr(adjusted)}\n{adj_note}\n"
+                     f"Subgroup rows: era x subgroup interaction in the adjusted model; events = pre / post; "
+                     f"interaction p = likelihood-ratio test.\n{design_note}",
+                     fontsize=8.5, fontweight="bold", loc="left")
+        plt.tight_layout()
+        fig.subplots_adjust(right=0.8)
+        pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
 
 
 # =============================================================================
@@ -4415,6 +4654,8 @@ def export_all(frame_full, entry_meta_full, downstream_meta_full, outcome_profes
             write_comorbidity_statement(pdf, frame, label)
             print("  Adjusted IRR forest plots (appended at the end)...")
             write_adjusted_forest_pages(pdf, frame, label)
+            print("  Era comparison pre vs post Oct 7 (appended at the end)...")
+            write_era_pages(pdf, frame, label)
         print(f"  Saved: {output_pdf}")
         print("  Descriptive companion...")
         write_descriptive_pdf(output_pdf.replace(".pdf", "_descriptive.pdf"),
@@ -4671,6 +4912,23 @@ def _run_sanity_checks_body(frame_full, entry_meta_full, downstream_meta_full, o
     check("<=20 km and >20 km-no-North populations are disjoint", not bool((in_a & in_b).any()),
           f"<=20km={int(in_a.sum()):,}, >20km no North={int(in_b.sum()):,}, "
           f"in neither={int((~in_a & ~in_b).sum()):,}")
+
+    # --- 11d. Era comparison: the model's crude IRR == (events/PY post) / (events/PY pre), the
+    # pre era has no person-time or events on/after Oct 7, and nobody is at risk past the cap ---
+    cohort = era_cohort(frame)
+    res = era_results(frame, cohort, "psychosis")
+    if res is not None:
+        c, pt = res["crude"], res["pt"]
+        ratio = (c["events_post"] / c["py_post"]) / (c["events_pre"] / c["py_pre"]) \
+            if c["events_pre"] and c["py_post"] else np.nan
+        check("Era model crude IRR == post/pre rate ratio [psychosis]",
+              pd.notna(c["irr"]) and abs(c["irr"] / ratio - 1) < 1e-6, f"model={c['irr']}, ratio={ratio}")
+        pre_entry = cohort.loc[pt.index, "entry"][pt["era"] == "pre"]
+        pre_py = pt.loc[pt["era"] == "pre", "py"]
+        check("Era pre-era person-time ends by Oct 7 and within the cap",
+              bool(((pre_entry + pd.to_timedelta(pre_py * 365.25, unit="D")) <= OCT7 + pd.Timedelta(hours=1)).all())
+              and bool((pt["py"] <= FIXED_WINDOW_DAYS / 365.25 + 1e-9).all()),
+              f"max py={pt['py'].max():.3f}")
 
     # --- 12. Informational only (data hypotheses, not code-correctness -- printed, not asserted) --
     for item in STATEMENT3_ROSE + STATEMENT3_DID_NOT_RISE:
