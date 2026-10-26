@@ -4746,7 +4746,7 @@ def export_all_diagnoser_modes(input_file, output_dir, trauma_mode=None):
 # PATHS -- adjust to the actual final matched-cohort file before running
 # =============================================================================
 
-INPUT_FILE = r"\\10.100.117.220\Projects$\R12-MHRC\Psychosis_Oct7_6Year_Amir\sagifolder\OutPutWorkingFiles\PsychosisPostWar\matched_cohort_FirstEverOutcomes.csv"
+INPUT_FILE = r"\\10.100.117.220\Projects$\R12-MHRC\Psychosis_Oct7_6Year_Amir\sagifolder\OutPutWorkingFiles\PsychosisPostWar\matched_cohort_PeriodOutComes4.csv"
 OUTPUT_DIR = r"\\10.100.117.220\Projects$\R12-MHRC\Psychosis_Oct7_6Year_Amir\sagifolder\OutPutWorkingFiles\PDF_PostWarPsychosis\PresentationSummary"
 
 if __name__ == "__main__":

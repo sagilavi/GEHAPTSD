@@ -7,7 +7,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 pd.set_option("display.width", 250)
 pd.set_option("display.max_columns", 20)
 
-INPUT_FILE = r"\\10.100.117.220\Projects$\R12-MHRC\Psychosis_Oct7_6Year_Amir\sagifolder\OutPutWorkingFiles\PsychosisPostWar\matched_cohort_FirstEverOutcomes.csv"
+INPUT_FILE = r"\\10.100.117.220\Projects$\R12-MHRC\Psychosis_Oct7_6Year_Amir\sagifolder\OutPutWorkingFiles\PsychosisPostWar\matched_cohort_PeriodOutComes4.csv"
 OUTPUT_CSV = r"C:\Users\sagil\MyCode\PTSD\followup_columns_samples.csv"
 N_SAMPLES = 10
 
