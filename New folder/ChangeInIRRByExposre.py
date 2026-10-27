@@ -3904,18 +3904,64 @@ def era_person_time(cohort, frame, outcome):
     return cohort.drop(columns=["entry"]).loc[start.index].assign(py=py, events=is_event.astype(int))
 
 
-def _era_fit(cells, covariates, subgroup=None):
-    """Poisson fit of era (ref = pre) + covariates [+ era x subgroup]. Returns (rows, loglik,
-    rank): rows = one era IRR (post vs pre) overall, or one per subgroup level."""
+# --- Third group, "crossing": X before Oct 7, followed FROM Oct 7 -----------------------------
+# The pre-diagnosed patients' second diagnosis after Oct 7. A group can't be defined by Y itself
+# (everyone in it would be a case and the rate would mean nothing), so it is defined by its
+# exposure time: pre-era patients still at risk on Oct 7 -- no Y by Oct 7, the cap (counted from
+# X, as for everyone) not yet reached, still a Clalit member -- followed from Oct 7 until the
+# earliest of Y, X + cap, leaving Clalit, STUDY_END. The same patient can be in "pre" (time up to
+# Oct 6) and "crossing" (time from Oct 7) -- the two never share a day of person-time.
+ERA_GROUP_LABELS = {"pre": "X before Oct 7", "post": "X on/after Oct 7",
+                    "crossing": "X before Oct 7, Y-free on Oct 7, followed from Oct 7"}
+ERA_COMPARISONS = [("post", "pre"), ("crossing", "pre"), ("crossing", "post")]   # (comparison, reference)
+
+
+def _crossing_boundary(cohort):
+    """Pre-era patients' latest possible follow-up end: X + cap, leaving Clalit, STUDY_END."""
+    pre = cohort[cohort["era"] == "pre"]
+    window_end = pre["entry"] + pd.to_timedelta(FIXED_WINDOW_DAYS, unit="D")
+    return pd.concat([window_end, pd.Series(STUDY_END, index=pre.index),
+                      followup_end_for(pre.index)], axis=1).min(axis=1)
+
+
+def group_cohort(cohort, group):
+    """Patients of one comparison group (Table 1 -- before the Y-specific prevalent exclusion)."""
+    if group == "crossing":
+        boundary = _crossing_boundary(cohort)
+        return cohort.loc[boundary[boundary > OCT7].index].assign(era="crossing")
+    return cohort[cohort["era"] == group]
+
+
+def group_person_time(cohort, frame, outcome, group):
+    """era_person_time() rows of one group; for "crossing", time counted from Oct 7."""
+    if group != "crossing":
+        pt = era_person_time(cohort, frame, outcome)
+        return pt[pt["era"] == group]
+    members = group_cohort(cohort, "crossing")
+    boundary = _crossing_boundary(cohort).reindex(members.index)
+    event = frame[f"first_{outcome}"].reindex(members.index)
+    at_risk = ~(event.notna() & (event <= OCT7))   # Y on/before Oct 7: not at risk of a first Y
+    members, boundary, event = members[at_risk], boundary[at_risk], event[at_risk]
+    is_event = event.notna() & (event <= boundary)
+    if LAG_DAYS > 0:
+        is_event &= (event - members["entry"]).dt.days >= LAG_DAYS
+    end = boundary.where(~is_event, event)
+    py = (end - OCT7).dt.days.clip(lower=0) / 365.25
+    return members.drop(columns=["entry"]).assign(py=py, events=is_event.astype(int))
+
+
+def _era_fit(cells, covariates, subgroup=None, cmp="post", ref="pre"):
+    """Poisson fit of group (cmp vs ref) + covariates [+ group x subgroup]. Returns (rows, loglik,
+    rank): rows = one IRR (cmp vs ref) overall, or one per subgroup level."""
     covariates = list(covariates)
     if subgroup and subgroup not in covariates:
         covariates.append(subgroup)
-    cols, names = _poisson_design(cells, "era", covariates, "pre")
-    post = (cells["era"] == "post").values.astype(float)
+    cols, names = _poisson_design(cells, "era", covariates, ref)
+    post = (cells["era"] == cmp).values.astype(float)
     levels = [None]
     if subgroup:
-        ref = str(cells.groupby(subgroup)["py"].sum().idxmax())
-        levels = [ref] + [l for l in sorted(cells[subgroup].astype(str).unique()) if l != ref]
+        sg_ref = str(cells.groupby(subgroup)["py"].sum().idxmax())
+        levels = [sg_ref] + [l for l in sorted(cells[subgroup].astype(str).unique()) if l != sg_ref]
         cols += [post * (cells[subgroup].astype(str) == l).values for l in levels[1:]]
     X = np.column_stack(cols)
     beta, cov, loglik = _irls(X, cells["events"].values.astype(float), np.log(cells["py"].values))
@@ -3923,14 +3969,14 @@ def _era_fit(cells, covariates, subgroup=None):
     rows = []
     for k, level in enumerate(levels):
         sub = cells if level is None else cells[cells[subgroup].astype(str) == level]
-        ev = sub.groupby("era")["events"].sum().reindex(["pre", "post"], fill_value=0)
-        py = sub.groupby("era")["py"].sum().reindex(["pre", "post"], fill_value=0)
-        row = {"level": level, "events_pre": int(ev["pre"]), "events_post": int(ev["post"]),
-               "py_pre": py["pre"], "py_post": py["post"],
+        ev = sub.groupby("era")["events"].sum().reindex([ref, cmp], fill_value=0)
+        py = sub.groupby("era")["py"].sum().reindex([ref, cmp], fill_value=0)
+        row = {"level": level, "events_ref": int(ev[ref]), "events_cmp": int(ev[cmp]),
+               "py_ref": py[ref], "py_cmp": py[cmp],
                "irr": np.nan, "lo": np.nan, "hi": np.nan, "p": np.nan}
-        if ev["pre"] > 0 and ev["post"] > 0:   # an era with no events -> IRR runs to 0 / inf
+        if ev[ref] > 0 and ev[cmp] > 0:   # a group with no events -> IRR runs to 0 / inf
             if k == 0:
-                b, v = beta[1], cov[1, 1]   # column 1 = "era: post"
+                b, v = beta[1], cov[1, 1]   # column 1 = "era: <cmp>"
             else:
                 m = len(names) + k - 1
                 b, v = beta[1] + beta[m], cov[1, 1] + cov[m, m] + 2 * cov[1, m]
@@ -3941,32 +3987,33 @@ def _era_fit(cells, covariates, subgroup=None):
     return rows, loglik, np.linalg.matrix_rank(X)
 
 
-def era_results(frame, cohort, outcome):
-    """Crude + adjusted era IRR and the subgroup interaction fits for one X -> Y pair. None if
-    nobody is at risk."""
-    pt = era_person_time(cohort, frame, outcome)
+def era_results(frame, cohort, outcome, cmp="post", ref="pre"):
+    """Crude + adjusted IRR (cmp vs ref) and the subgroup interaction fits for one X -> Y pair.
+    None if either group has nobody at risk."""
+    pt = pd.concat([group_person_time(cohort, frame, outcome, ref),
+                    group_person_time(cohort, frame, outcome, cmp)])
     cells = pt.groupby(["era"] + ERA_COVARIATES + ["Distance from Gaza", ERA_DIST3],
                        as_index=False)[["py", "events"]].sum()
     cells = cells[cells["py"] > 0].reset_index(drop=True)
     if cells.empty or cells["era"].nunique() < 2:
         return None
-    out = {"pt": pt, "crude": _era_fit(cells, [])[0][0],
-           "adjusted": _era_fit(cells, ERA_COVARIATES)[0][0],
-           "adjusted + distance": _era_fit(cells, ERA_COVARIATES + [ERA_DIST3])[0][0], "subgroups": {}}
+    fit = lambda covs, sg=None: _era_fit(cells, covs, sg, cmp=cmp, ref=ref)
+    out = {"pt": pt, "crude": fit([])[0][0], "adjusted": fit(ERA_COVARIATES)[0][0],
+           "adjusted + distance": fit(ERA_COVARIATES + [ERA_DIST3])[0][0], "subgroups": {}}
     for sg in ERA_SUBGROUPS:
         covs = ERA_COVARIATES if sg in ERA_COVARIATES else ERA_COVARIATES + [sg]
-        _, ll0, rank0 = _era_fit(cells, covs)
-        rows, ll1, rank1 = _era_fit(cells, covs, sg)
+        _, ll0, rank0 = fit(covs)
+        rows, ll1, rank1 = fit(covs, sg)
         p_int = stats.chi2.sf(max(2 * (ll1 - ll0), 0), rank1 - rank0) if rank1 > rank0 else np.nan
         out["subgroups"][sg] = (rows, p_int)
     return out
 
 
-def smd_rows(cohort):
-    """Table-1 rows pre vs post: age at X as a mean, then every level of each covariate as
-    n (%) with its SMD (post - pre). Both distance variables are listed: the 4-level subgroup and
+def smd_rows(cohort, cmp="post", ref="pre"):
+    """Table-1 rows ref vs cmp: age at X as a mean, then every level of each covariate as
+    n (%) with its SMD (cmp - ref). Both distance variables are listed: the 4-level subgroup and
     the 3-category one used in the "adjusted + distance" model."""
-    pre, post = cohort[cohort["era"] == "pre"], cohort[cohort["era"] == "post"]
+    pre, post = cohort[cohort["era"] == ref], cohort[cohort["era"] == cmp]
     rows = []
     a, b = pre["age_x"].dropna(), post["age_x"].dropna()
     sd = np.sqrt((a.var() + b.var()) / 2) if len(a) > 1 and len(b) > 1 else np.nan
@@ -3992,45 +4039,73 @@ def _fmt_irr(r):
     return f"{r['irr']:.2f} [{r['lo']:.2f}-{r['hi']:.2f}], p = {_fmt_p(r['p'])}"
 
 
+def section_divider(pdf, title, subtitle=""):
+    """Full gray page naming the next section -- separates the sections of the main PDF."""
+    fig = plt.figure(figsize=(11, 8.5))
+    fig.patch.set_facecolor("#d3d6da")
+    fig.text(0.5, 0.55, title, ha="center", va="center", fontsize=30, fontweight="bold", color="#343a40")
+    if subtitle:
+        fig.text(0.5, 0.45, subtitle, ha="center", va="center", fontsize=14, color="#495057", wrap=True)
+    pdf.savefig(fig, facecolor=fig.get_facecolor()); plt.close(fig)
+
+
 def write_era_pages(pdf, frame, age_label):
+    """One section per comparison in ERA_COMPARISONS, each preceded by a gray divider page."""
+    cohort = era_cohort(frame)
+    for k, (cmp, ref) in enumerate(ERA_COMPARISONS):
+        if k > 0:
+            section_divider(pdf, f"ERA COMPARISON {k + 1}",
+                            f"{TRAUMA_EXPOSURE_LABEL}: {_era_group_label(cmp)}  vs  {_era_group_label(ref)}")
+        write_era_comparison(pdf, frame, cohort, age_label, cmp, ref)
+
+
+def _era_group_label(group):
+    return ERA_GROUP_LABELS[group].replace("X ", f"{TRAUMA_EXPOSURE_LABEL} ")
+
+
+def write_era_comparison(pdf, frame, cohort, age_label, cmp="post", ref="pre"):
     x_label = TRAUMA_EXPOSURE_LABEL
     cap = f"{FIXED_WINDOW_DAYS // 30}mo"
     design_note = (f"Cohort: first-ever {x_label} from 2017 at age 15+. Person-time from {x_label} to the "
                    f"earliest of Y, {cap} after {x_label}, leaving Clalit, 30.6.2026; pre era also "
                    f"censored at 6.10.2023. Prevalent Y excluded.")
+    if "crossing" in (cmp, ref):
+        design_note += (f"\nCrossing group: {x_label} before Oct 7 and no Y by 7.10.2023; person-time from "
+                        f"7.10.2023 to the earliest of Y, {cap} after {x_label}, leaving Clalit, 30.6.2026.")
     adj_note = ("Adjusted: age at X (" + "/".join(l for _, _, l in ERA_AGE_BANDS) + "), sex, sector, "
                 "SES (5-level), Charlson (0/1/2/3+). Poisson, offset log(person-years), 95% Wald CI.")
-    cohort = era_cohort(frame)
-    n_pre, n_post = int((cohort["era"] == "pre").sum()), int((cohort["era"] == "post").sum())
-    if n_pre == 0 or n_post == 0:
-        print(f"  Era comparison skipped: pre={n_pre:,}, post={n_post:,} patients")
+    vs = f"{cmp} vs {ref}"
+    groups = pd.concat([group_cohort(cohort, ref), group_cohort(cohort, cmp)])
+    n_ref, n_cmp = int((groups["era"] == ref).sum()), int((groups["era"] == cmp).sum())
+    if n_ref == 0 or n_cmp == 0:
+        print(f"  Era comparison {vs} skipped: {ref}={n_ref:,}, {cmp}={n_cmp:,} patients")
         return
 
-    # --- Table 1: the whole X cohort, pre vs post ---
-    t1 = smd_rows(cohort)
+    # --- Table 1: the two groups' whole X cohort ---
+    t1 = smd_rows(groups, cmp=cmp, ref=ref)
     t1["Level"] = t1["Level"].map(rtl)
     t1["SMD"] = t1["SMD"].map(lambda s: "-" if pd.isna(s) else f"{s:+.3f}" + (" *" if abs(s) > SMD_THRESHOLD else ""))
-    t1 = t1.rename(columns={"pre": f"Pre Oct 7 (n={n_pre:,})", "post": f"Post Oct 7 (n={n_post:,})"})
-    draw_table_page(pdf, f"ERA COMPARISON | Table 1 | {x_label} diagnosed before vs on/after Oct 7 | "
+    t1 = t1.rename(columns={"pre": f"{ref.capitalize()} (n={n_ref:,})", "post": f"{cmp.capitalize()} (n={n_cmp:,})"})
+    draw_table_page(pdf, f"ERA COMPARISON | Table 1 | {_era_group_label(cmp)} vs {_era_group_label(ref)} | "
                          f"{age_label}", t1.set_index("Covariate"),
-                    note=(f"SMD = standardized mean difference, post - pre (* = |SMD| > {SMD_THRESHOLD}: an "
+                    note=(f"SMD = standardized mean difference, {cmp} - {ref} (* = |SMD| > {SMD_THRESHOLD}: an "
                           f"imbalance worth noting).\nEvery confounder enters the adjusted model regardless of "
                           f"its SMD; 'Distance from Gaza' is a subgroup only; '{ERA_DIST3}' is a subgroup and "
                           f"also the extra confounder of the 'adjusted + distance' model.\n{design_note}"),
                     font_size=7)
 
     for outcome in era_outcomes():
-        res = era_results(frame, cohort, outcome)
+        res = era_results(frame, cohort, outcome, cmp=cmp, ref=ref)
         pair = f"{x_label} -> {outcome.upper()}"
         if res is None:
-            print(f"  Era comparison {pair}: nobody at risk, skipped")
+            print(f"  Era comparison {vs} {pair}: nobody at risk, skipped")
             continue
         crude, adjusted = res["crude"], res["adjusted"]
-        counts = (f"pre: {crude['events_pre']:,} events / {crude['py_pre']:,.0f} PY, "
-                  f"post: {crude['events_post']:,} events / {crude['py_post']:,.0f} PY")
+        counts = (f"{ref}: {crude['events_ref']:,} events / {crude['py_ref']:,.0f} PY, "
+                  f"{cmp}: {crude['events_cmp']:,} events / {crude['py_cmp']:,.0f} PY")
 
         # --- love plot: SMD per covariate level, in this pair's at-risk cohort ---
-        smd = smd_rows(res["pt"])
+        smd = smd_rows(res["pt"], cmp=cmp, ref=ref)
         smd = smd[smd["Covariate"] != "Distance from Gaza"].iloc[::-1].reset_index(drop=True)
         labels = [f"{c}: {rtl(l)}" if l != "mean (SD)" else c for c, l in zip(smd["Covariate"], smd["Level"])]
         fig, ax = plt.subplots(figsize=(11, 0.28 * len(smd) + 2.2))
@@ -4042,8 +4117,9 @@ def write_era_pages(pdf, frame, age_label):
         ax.set_yticks(range(len(smd)))
         ax.set_yticklabels(labels, fontsize=7.5)
         ax.set_xlim(0, max(abs_smd.max() * 1.15 if abs_smd.notna().any() else 0, 0.25))
-        ax.set_xlabel("|SMD| pre vs post Oct 7 (dashed line = 0.1)", fontsize=8)
-        ax.set_title(f"LOVE PLOT | {pair} | {age_label}\nCrude IRR post vs pre: {_fmt_irr(crude)}\n"
+        ax.set_xlabel(f"|SMD| {vs} (dashed line = 0.1)", fontsize=8)
+        ax.set_title(f"LOVE PLOT | {pair} | {_era_group_label(cmp)} vs {_era_group_label(ref)} | {age_label}\n"
+                     f"Crude IRR {vs}: {_fmt_irr(crude)}\n"
                      f"{counts}\n{design_note}", fontsize=8.5, fontweight="bold", loc="left")
         plt.tight_layout()
         pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
@@ -4056,15 +4132,16 @@ def write_era_pages(pdf, frame, age_label):
         for sg, (sg_rows, p_int) in res["subgroups"].items():
             rows.append((f"{sg}  (interaction p = {_fmt_p(p_int)})", None, None, None, None))
             for r in sorted(sg_rows, key=lambda r: _level_order(r["level"])):
-                rows.append((f"   {rtl(r['level'])}  ({r['events_pre']:,} / {r['events_post']:,} events)",
+                rows.append((f"   {rtl(r['level'])}  ({r['events_ref']:,} / {r['events_cmp']:,} events)",
                              r["irr"], r["lo"], r["hi"], ERA_COLORS["subgroup"]))
         fig, ax = plt.subplots(figsize=(11, 0.3 * len(rows) + 2.2))
-        draw_forest(ax, rows, "", xlabel="Adjusted IRR post vs pre Oct 7 (log scale), 95% CI")
-        ax.set_title(f"FOREST | {pair} | adjusted IRR post vs pre Oct 7, overall and per subgroup | "
+        draw_forest(ax, rows, "", xlabel=f"Adjusted IRR {vs} (log scale), 95% CI")
+        ax.set_title(f"FOREST | {pair} | adjusted IRR {_era_group_label(cmp)} vs {_era_group_label(ref)}, "
+                     f"overall and per subgroup | "
                      f"{age_label}\nAdjusted IRR: {_fmt_irr(adjusted)}   |   Adjusted + distance: "
                      f"{_fmt_irr(res['adjusted + distance'])}\n{adj_note} 'Adjusted + distance' also adjusts "
                      f"for {ERA_DIST3} ({' / '.join(ERA_DIST3_LEVELS)}).\n"
-                     f"Subgroup rows: era x subgroup interaction in the adjusted model; events = pre / post; "
+                     f"Subgroup rows: group x subgroup interaction in the adjusted model; events = {ref} / {cmp}; "
                      f"interaction p = likelihood-ratio test.\n{design_note}",
                      fontsize=8.5, fontweight="bold", loc="left")
         plt.tight_layout()
@@ -4662,23 +4739,33 @@ def export_all(frame_full, entry_meta_full, downstream_meta_full, outcome_profes
         with PdfPages(output_pdf) as pdf:
             print("  Statement 1...")
             write_statement1(pdf, frame, label)
+            section_divider(pdf, "STATEMENT 1 -- SUPPORTING TESTS", label)
             print("  Statement 1 (supporting tests)...")
             write_statement1_supporting(pdf, frame, entry_meta, downstream_meta, label)
+            section_divider(pdf, "STATEMENT 2", label)
             print("  Statement 2...")
             write_statement2(pdf, frame, label)
+            section_divider(pdf, "STATEMENT 3", label)
             print("  Statement 3...")
             write_statement3(pdf, frame, label)
+            section_divider(pdf, "STATEMENT 5", label)
             print("  Statement 5...")
             write_statement5(pdf, outcome_profession_meta, label)
+            section_divider(pdf, "STATEMENT 6", label)
             print("  Statement 6...")
             write_statement6(pdf, frame, label)
+            section_divider(pdf, "STATEMENT 2 -- EXTENDED", label)
             print("  Statement 2 (extended, appended at the end)...")
             write_statement2_extended(pdf, frame, label)
+            section_divider(pdf, "COMORBIDITY", label)
             print("  Comorbidity (appended at the end)...")
             write_comorbidity_statement(pdf, frame, label)
+            section_divider(pdf, "ADJUSTED IRR -- vs GENERAL POPULATION", label)
             print("  Adjusted IRR forest plots (appended at the end)...")
             write_adjusted_forest_pages(pdf, frame, label)
-            print("  Era comparison pre vs post Oct 7 (appended at the end)...")
+            section_divider(pdf, "ERA COMPARISON 1",
+                            f"{TRAUMA_EXPOSURE_LABEL}: {_era_group_label('post')}  vs  {_era_group_label('pre')}")
+            print("  Era comparisons (pre / post / crossing Oct 7, appended at the end)...")
             write_era_pages(pdf, frame, label)
         print(f"  Saved: {output_pdf}")
         print("  Descriptive companion...")
@@ -4949,8 +5036,8 @@ def _run_sanity_checks_body(frame_full, entry_meta_full, downstream_meta_full, o
     res = era_results(frame, cohort, "psychosis")
     if res is not None:
         c, pt = res["crude"], res["pt"]
-        ratio = (c["events_post"] / c["py_post"]) / (c["events_pre"] / c["py_pre"]) \
-            if c["events_pre"] and c["py_post"] else np.nan
+        ratio = (c["events_cmp"] / c["py_cmp"]) / (c["events_ref"] / c["py_ref"]) \
+            if c["events_ref"] and c["py_cmp"] else np.nan
         check("Era model crude IRR == post/pre rate ratio [psychosis]",
               pd.notna(c["irr"]) and abs(c["irr"] / ratio - 1) < 1e-6, f"model={c['irr']}, ratio={ratio}")
         pre_entry = cohort.loc[pt.index, "entry"][pt["era"] == "pre"]
@@ -4959,6 +5046,15 @@ def _run_sanity_checks_body(frame_full, entry_meta_full, downstream_meta_full, o
               bool(((pre_entry + pd.to_timedelta(pre_py * 365.25, unit="D")) <= OCT7 + pd.Timedelta(hours=1)).all())
               and bool((pt["py"] <= FIXED_WINDOW_DAYS / 365.25 + 1e-9).all()),
               f"max py={pt['py'].max():.3f}")
+    # crossing group: time only from Oct 7, never past X + cap, and nobody with Y by Oct 7
+    cr = group_person_time(cohort, frame, "psychosis", "crossing")
+    if len(cr):
+        cr_entry = cohort.loc[cr.index, "entry"]
+        cap_left = (cr_entry + pd.to_timedelta(FIXED_WINDOW_DAYS, unit="D") - OCT7).dt.days / 365.25
+        y = frame.loc[cr.index, "first_psychosis"]
+        check("Era crossing group: from Oct 7, within X + cap, nobody with Y by Oct 7",
+              bool((cr_entry < OCT7).all()) and bool((cr["py"] <= cap_left + 1e-9).all())
+              and not bool((y <= OCT7).any()), f"n={len(cr):,}, events={int(cr['events'].sum())}")
 
     # --- 12. Informational only (data hypotheses, not code-correctness -- printed, not asserted) --
     for item in STATEMENT3_ROSE + STATEMENT3_DID_NOT_RISE:
