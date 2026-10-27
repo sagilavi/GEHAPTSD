@@ -3846,9 +3846,19 @@ def write_adjusted_forest_pages(pdf, frame, age_label):
 ERA_AGE_BANDS = [(15, 25, "15-24"), (25, 35, "25-34"), (35, 45, "35-44"), (45, 65, "45-64"),
                  (65, 200, "65+")]
 ERA_COVARIATES = ["Age at X"] + ADJ_COVARIATES
-ERA_SUBGROUPS = ["Sex", "Sector", "Age at X", "Distance from Gaza"]
-ERA_COLORS = {"crude": ADJ_COLORS["crude"], "adjusted": ADJ_COLORS["adjusted"], "subgroup": "#457b9d"}
+# 3-category distance: a confounder in the "adjusted + distance" model only (the main adjusted
+# model is unchanged). Missing distance goes with 20+ -- no distance = not near a border.
+ERA_DIST3 = "Distance (3 cat)"
+ERA_DIST3_LEVELS = ["0-7 km", "7-20 km", "20+ km / missing"]
+ERA_SUBGROUPS = ["Sex", "Sector", "Age at X", "Distance from Gaza", ERA_DIST3]
+ERA_COLORS = {"crude": ADJ_COLORS["crude"], "adjusted": ADJ_COLORS["adjusted"],
+              "adjusted + distance": "#9d0208", "subgroup": "#457b9d"}
 SMD_THRESHOLD = 0.1
+
+
+def _level_order(level):
+    """Sort key: the 3 distance categories in distance order, everything else alphabetically."""
+    return (ERA_DIST3_LEVELS.index(level), "") if level in ERA_DIST3_LEVELS else (99, str(level))
 
 
 def era_outcomes():
@@ -3870,9 +3880,13 @@ def era_cohort(frame):
     distance[f["distance_km"] <= 20] = "<=20 km"
     distance[f["distance_km"] > 20] = ">20 km (not North)"
     distance[f["is_north_border"].astype(bool)] = "Northern Border"
+    dist3 = pd.Series(ERA_DIST3_LEVELS[2], index=entry.index, dtype=object)
+    dist3[f["distance_km"] <= 20] = ERA_DIST3_LEVELS[1]
+    dist3[f["distance_km"] <= 7] = ERA_DIST3_LEVELS[0]
     cohort = adjustment_covariates(f)
     cohort.insert(0, "Age at X", age_band)
     cohort["Distance from Gaza"] = distance
+    cohort[ERA_DIST3] = dist3
     cohort["entry"] = entry
     cohort["era"] = np.where(entry < OCT7, "pre", "post")
     cohort["age_x"] = age_x
@@ -3931,12 +3945,14 @@ def era_results(frame, cohort, outcome):
     """Crude + adjusted era IRR and the subgroup interaction fits for one X -> Y pair. None if
     nobody is at risk."""
     pt = era_person_time(cohort, frame, outcome)
-    cells = pt.groupby(["era"] + ERA_COVARIATES + ["Distance from Gaza"], as_index=False)[["py", "events"]].sum()
+    cells = pt.groupby(["era"] + ERA_COVARIATES + ["Distance from Gaza", ERA_DIST3],
+                       as_index=False)[["py", "events"]].sum()
     cells = cells[cells["py"] > 0].reset_index(drop=True)
     if cells.empty or cells["era"].nunique() < 2:
         return None
     out = {"pt": pt, "crude": _era_fit(cells, [])[0][0],
-           "adjusted": _era_fit(cells, ERA_COVARIATES)[0][0], "subgroups": {}}
+           "adjusted": _era_fit(cells, ERA_COVARIATES)[0][0],
+           "adjusted + distance": _era_fit(cells, ERA_COVARIATES + [ERA_DIST3])[0][0], "subgroups": {}}
     for sg in ERA_SUBGROUPS:
         covs = ERA_COVARIATES if sg in ERA_COVARIATES else ERA_COVARIATES + [sg]
         _, ll0, rank0 = _era_fit(cells, covs)
@@ -3948,15 +3964,16 @@ def era_results(frame, cohort, outcome):
 
 def smd_rows(cohort):
     """Table-1 rows pre vs post: age at X as a mean, then every level of each covariate as
-    n (%) with its SMD (post - pre). The distance subgroup is listed too (it isn't a confounder)."""
+    n (%) with its SMD (post - pre). Both distance variables are listed: the 4-level subgroup and
+    the 3-category one used in the "adjusted + distance" model."""
     pre, post = cohort[cohort["era"] == "pre"], cohort[cohort["era"] == "post"]
     rows = []
     a, b = pre["age_x"].dropna(), post["age_x"].dropna()
     sd = np.sqrt((a.var() + b.var()) / 2) if len(a) > 1 and len(b) > 1 else np.nan
     rows.append(("Age at X (years)", "mean (SD)", f"{a.mean():.1f} ({a.std():.1f})",
                  f"{b.mean():.1f} ({b.std():.1f})", (b.mean() - a.mean()) / sd if sd > 0 else np.nan))
-    for cov in ERA_COVARIATES + ["Distance from Gaza"]:
-        for level in sorted(cohort[cov].astype(str).unique()):
+    for cov in ERA_COVARIATES + ["Distance from Gaza", ERA_DIST3]:
+        for level in sorted(cohort[cov].astype(str).unique(), key=_level_order):
             n1, n2 = int((pre[cov] == level).sum()), int((post[cov] == level).sum())
             p1, p2 = n1 / max(len(pre), 1), n2 / max(len(post), 1)
             v = (p1 * (1 - p1) + p2 * (1 - p2)) / 2
@@ -3998,7 +4015,8 @@ def write_era_pages(pdf, frame, age_label):
                          f"{age_label}", t1.set_index("Covariate"),
                     note=(f"SMD = standardized mean difference, post - pre (* = |SMD| > {SMD_THRESHOLD}: an "
                           f"imbalance worth noting).\nEvery confounder enters the adjusted model regardless of "
-                          f"its SMD; 'Distance from Gaza' is a subgroup only, not adjusted for.\n{design_note}"),
+                          f"its SMD; 'Distance from Gaza' is a subgroup only; '{ERA_DIST3}' is a subgroup and "
+                          f"also the extra confounder of the 'adjusted + distance' model.\n{design_note}"),
                     font_size=7)
 
     for outcome in era_outcomes():
@@ -4032,17 +4050,20 @@ def write_era_pages(pdf, frame, age_label):
 
         # --- forest: adjusted IRR overall and per subgroup level, with the interaction p ---
         rows = [("Overall", None, None, None, None)]
-        for kind, r in [("crude", crude), ("adjusted", adjusted)]:
+        for kind in ["crude", "adjusted", "adjusted + distance"]:
+            r = res[kind]
             rows.append((f"   {kind}", r["irr"], r["lo"], r["hi"], ERA_COLORS[kind]))
         for sg, (sg_rows, p_int) in res["subgroups"].items():
             rows.append((f"{sg}  (interaction p = {_fmt_p(p_int)})", None, None, None, None))
-            for r in sorted(sg_rows, key=lambda r: r["level"]):
+            for r in sorted(sg_rows, key=lambda r: _level_order(r["level"])):
                 rows.append((f"   {rtl(r['level'])}  ({r['events_pre']:,} / {r['events_post']:,} events)",
                              r["irr"], r["lo"], r["hi"], ERA_COLORS["subgroup"]))
         fig, ax = plt.subplots(figsize=(11, 0.3 * len(rows) + 2.2))
         draw_forest(ax, rows, "", xlabel="Adjusted IRR post vs pre Oct 7 (log scale), 95% CI")
         ax.set_title(f"FOREST | {pair} | adjusted IRR post vs pre Oct 7, overall and per subgroup | "
-                     f"{age_label}\nAdjusted IRR: {_fmt_irr(adjusted)}\n{adj_note}\n"
+                     f"{age_label}\nAdjusted IRR: {_fmt_irr(adjusted)}   |   Adjusted + distance: "
+                     f"{_fmt_irr(res['adjusted + distance'])}\n{adj_note} 'Adjusted + distance' also adjusts "
+                     f"for {ERA_DIST3} ({' / '.join(ERA_DIST3_LEVELS)}).\n"
                      f"Subgroup rows: era x subgroup interaction in the adjusted model; events = pre / post; "
                      f"interaction p = likelihood-ratio test.\n{design_note}",
                      fontsize=8.5, fontweight="bold", loc="left")
@@ -4602,8 +4623,11 @@ POPULATIONS = {
                         lambda f: f["distance_km"] <= 20),
     "over20km_nonorth": (">20 km from Gaza, no Northern Border", "_over20km_nonorth",
                          lambda f: (f["distance_km"] > 20) & ~f["is_north_border"]),
+    # missing distance is KEPT here (no distance = not near a border)
+    "no7km_nonorth":   ("no 0-7 km from Gaza, no Northern Border (missing distance kept)", "_no7km_nonorth",
+                        lambda f: ~(f["distance_km"] <= 7) & ~f["is_north_border"].astype(bool)),
 }
-EXTRA_POPULATIONS = ["gaza20km", "over20km_nonorth"]   # run for the SLIM combination only
+EXTRA_POPULATIONS = ["gaza20km", "over20km_nonorth", "no7km_nonorth"]   # run for the SLIM combination only
 
 
 def apply_population(frame, entry_meta, downstream_meta, outcome_profession_meta, population_key):
@@ -4912,6 +4936,12 @@ def _run_sanity_checks_body(frame_full, entry_meta_full, downstream_meta_full, o
     check("<=20 km and >20 km-no-North populations are disjoint", not bool((in_a & in_b).any()),
           f"<=20km={int(in_a.sum()):,}, >20km no North={int(in_b.sum()):,}, "
           f"in neither={int((~in_a & ~in_b).sum()):,}")
+    in_c = POPULATIONS["no7km_nonorth"][2](frame).fillna(False).astype(bool)
+    no_dist = frame["distance_km"].isna() & ~frame["is_north_border"].astype(bool)
+    check("no-0-7km-no-North population: nobody <=7 km or North, everyone with missing distance kept",
+          not bool((in_c & ((frame["distance_km"] <= 7) | frame["is_north_border"].astype(bool))).any())
+          and bool(in_c[no_dist].all()),
+          f"kept={int(in_c.sum()):,}, of them missing distance={int((in_c & no_dist).sum()):,}")
 
     # --- 11d. Era comparison: the model's crude IRR == (events/PY post) / (events/PY pre), the
     # pre era has no person-time or events on/after Oct 7, and nobody is at risk past the cap ---
