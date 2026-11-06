@@ -61,6 +61,19 @@ def read_header(path):
     return list(pd.read_csv(path, encoding=HEBREW_ENCODING, nrows=0).columns)
 
 
+def is_wanted_column(col):
+    """Drops "demographics*" and "charlson*" columns unless "2023" is in the name."""
+    col_lower = col.lower()
+    return "2023" in col_lower or not col_lower.startswith(("demographics", "charlson"))
+
+
+def read_wanted_columns(path):
+    header = read_header(path)
+    wanted = [col for col in header if is_wanted_column(col)]
+    print(f"{path.name}: {len(header)} columns, keeping {len(wanted)} after the demographics/charlson filter")
+    return wanted
+
+
 def bucket_path(table_index, bucket):
     return work_dir / f"table{table_index}_bucket{bucket}.csv"
 
@@ -107,14 +120,14 @@ secondary_paths = sorted(
 )
 
 # Filter out columns containing "medication" from the primary file
-primary_columns = [col for col in read_header(primary_file_path) if "medication" not in col]
+primary_columns = [col for col in read_wanted_columns(primary_file_path) if "medication" not in col]
 tables = [(primary_file_path, primary_columns)]
 seen_columns = set(primary_columns)
 
 # A column name that already exists (except the merge key) is dropped from the
 # later file, to prevent suffix duplicates (_x, _y)
 for item in secondary_paths:
-    header = read_header(item)
+    header = read_wanted_columns(item)
     duplicate_cols = [col for col in header if col in seen_columns and col != merge_key]
     if duplicate_cols:
         print(f"Dropping duplicate columns from {item.name}: {duplicate_cols}")
