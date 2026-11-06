@@ -29,7 +29,7 @@ import pandas as pd
 
 # 1. Define source path
 base_path = Path(
-    r"\\10.100.117.220\Projects$\R12-MHRC\Psychosis_Oct7_6Year_Amir\RawData\MDclone15 and older"
+    r"\\10.100.117.220\Projects$\R12-MHRC\Psychosis_Oct7_6Year_Amir\sagifolder\RawData\15 and older"
 )
 
 # 2. Define output path
