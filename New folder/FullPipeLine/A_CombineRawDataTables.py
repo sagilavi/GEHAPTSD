@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 from pathlib import Path
 import pandas as pd
@@ -16,7 +17,10 @@ import pandas as pd
 # If memory still runs out, raise N_BUCKETS and lower CHUNK_ROWS.
 #
 # Every value is read as raw text, so it reaches the output exactly as it
-# appears in the source (no dtype guessing, and no DtypeWarning).
+# appears in the source (no dtype guessing, and no DtypeWarning). The one
+# exception: the time is stripped from date columns, "23/10/2021 17:30:04"
+# becomes "23/10/2021". Dates stay as day-first text, so parse them later with
+# dayfirst=True.
 # Output rows are grouped by bucket, so they are NOT in the primary file's order.
 #
 # Any failure stops the run: the output is only put in place once every file
@@ -48,6 +52,10 @@ HEBREW_ENCODING = "utf-8"
 N_BUCKETS = 64
 CHUNK_ROWS = 50_000
 
+DATE_COLUMN_PATTERN = re.compile(r"\bdate\b", re.IGNORECASE)
+# Only matches a value that starts with a date, so free text is left alone
+DATE_WITH_TIME_PATTERN = r"^(\d[\d/.\-]*)\s+\d{1,2}:\d{2}.*$"
+
 
 def read_header(path):
     return list(pd.read_csv(path, encoding=HEBREW_ENCODING, nrows=0).columns)
@@ -60,6 +68,8 @@ def bucket_path(table_index, bucket):
 def split_into_buckets(path, table_index, columns):
     """Stream one table into per-bucket files. Returns its row count."""
     n_rows = 0
+    date_cols = [col for col in columns if DATE_COLUMN_PATTERN.search(col)]
+    print(f"  Stripping time from {len(date_cols)} date columns: {date_cols}")
     reader = pd.read_csv(
         path,
         encoding=HEBREW_ENCODING,
@@ -69,7 +79,9 @@ def split_into_buckets(path, table_index, columns):
         chunksize=CHUNK_ROWS,
     )
     for chunk in reader:
-        chunk = chunk[columns]
+        chunk = chunk[columns].copy()
+        for col in date_cols:
+            chunk[col] = chunk[col].str.replace(DATE_WITH_TIME_PATTERN, r"\1", regex=True)
         n_rows += len(chunk)
         buckets = pd.util.hash_pandas_object(chunk[merge_key], index=False) % N_BUCKETS
         for bucket, rows in chunk.groupby(buckets.to_numpy()):
