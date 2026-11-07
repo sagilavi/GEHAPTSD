@@ -49,7 +49,17 @@ SOURCE_ID_COL    = "mdcinternalpatientid"
 SOURCE_START_COL = "clalit membership-membership start date"
 SOURCE_END_COL   = "clalit membership-membership end date"
 
-DATE_FORMAT = "%d/%m/%Y"
+DATE_FORMAT = "%d/%m/%Y"   # written to the output
+# The membership file holds "2000-01-06 00:00:00"; DD/MM/YYYY is accepted too. Only the date part is read.
+MEMBERSHIP_DATE_FORMATS = ["%Y-%m-%d", "%d/%m/%Y"]
+
+
+def parse_membership_dates(values):
+    text = values.str.strip().str[:10]
+    parsed = pd.to_datetime(text, format=MEMBERSHIP_DATE_FORMATS[0], errors="coerce")
+    for fmt in MEMBERSHIP_DATE_FORMATS[1:]:
+        parsed = parsed.fillna(pd.to_datetime(text, format=fmt, errors="coerce"))
+    return parsed
 
 
 def columns_script_c_reads():
@@ -122,10 +132,8 @@ def read_membership_periods(path):
         n_rows += len(chunk)
         period = pd.DataFrame({
             "id": normalize_id(chunk[SOURCE_ID_COL]),
-            "start": pd.to_datetime(chunk[SOURCE_START_COL].str.strip().str[:10],
-                                    format=DATE_FORMAT, errors="coerce"),
-            "end": pd.to_datetime(chunk[SOURCE_END_COL].str.strip().str[:10],
-                                  format=DATE_FORMAT, errors="coerce"),
+            "start": parse_membership_dates(chunk[SOURCE_START_COL]),
+            "end": parse_membership_dates(chunk[SOURCE_END_COL]),
         })
         for reason, field, raw_col in [("no 0x id", "id", SOURCE_ID_COL),
                                        ("bad start date", "start", SOURCE_START_COL),
