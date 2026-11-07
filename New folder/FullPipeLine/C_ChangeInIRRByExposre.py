@@ -30,7 +30,7 @@ warnings.filterwarnings("ignore")
 #
 # SECOND independent axis: DIAGNOSER MODE (any diagnoser / psychiatrist-only /
 # non-psychiatrist-only -- see DIAGNOSER_MODES). Filters EVERY exposure in the
-# script (trauma in Statement 1, and all 7 alternate exposures in Statement
+# script (trauma in Statement 1, and all 8 alternate exposures in Statement
 # 2's B1 analysis) to only those whose earliest diagnosis was given by a
 # psychiatrist / someone else / anyone. Tests the "diagnostic dilution"
 # hypothesis directly: if the pre/post RR gap shrinks or vanishes once
@@ -157,17 +157,17 @@ warnings.filterwarnings("ignore")
 # STATEMENT 2 ("B1" -- alternate entry-diagnoses can outrank trauma as a
 #   predictor of later psychosis/bipolar):
 #   Page 1: RR bar chart (windowed + censored, as above), one panel for
-#           psychosis and one for bipolar, across ALL 7 possible entry
+#           psychosis and one for bipolar, across ALL 8 possible entry
 #           exposures (PTSD/ASR, Depression, Anxiety, Substance, Bipolar,
-#           Psychosis, Personality -- excluding the outcome itself).
+#           Psychosis, Personality, OCD -- excluding the outcome itself).
 #           [the original B1 chart's source script was not available; this
 #            reproduces its spirit as the multi-exposure counterpart of H2,
 #            now on the same windowed footing as the rest of the script]
 #   Page 2+3: pre/post-war heatmaps (whole-year window), generalized from
-#           PTSD/ASR-only (TEST 2c) to all 7 alternate entry exposures, for
+#           PTSD/ASR-only (TEST 2c) to all 8 alternate entry exposures, for
 #           psychosis + bipolar as the two downstream columns.
 #   Page 4: bar-chart view of pages 2+3's exact same data -- one panel per
-#           downstream outcome, X-axis = the 7 exposures, 2 bars each
+#           downstream outcome, X-axis = the 8 exposures, 2 bars each
 #           (before/after), added on request. NOTE: page 5 below (the %
 #           change heatmap) is DERIVED from pages 2+3's same before/after
 #           values, so it doesn't get its own separate bar-chart page --
@@ -187,6 +187,7 @@ warnings.filterwarnings("ignore")
 #     border == 'גבול הצפון') > Rest of Israel.
 #   ROSE section:        total, ptsd, asr, anxiety, depression
 #   DID-NOT-RISE section: psychosis, bipolar, substance, personality
+#   NOT-YET-CLASSIFIED section: OCD
 #   Run on both age bands. NOT windowed the way Statements 1/2 are -- this is
 #   a population-level incidence-rate analysis, not a "second illness after
 #   the first" exposure→outcome design, so the fixed-window logic above
@@ -198,7 +199,7 @@ warnings.filterwarnings("ignore")
 #   there's a numbering gap here by design, not a missing page.
 #
 # STATEMENT 5 (who diagnoses what): TWO pages, 2 panels each (Before / On-after
-#   Oct 7), % of each of the 8 outcomes' first-ever diagnoses given by a
+#   Oct 7), % of each of the 9 outcomes' first-ever diagnoses given by a
 #   psychiatrist -- one page excluding code 999 (Unknown/Admin) from both
 #   numerator and denominator, one page counting it as non-psychiatrist (a
 #   sensitivity comparison, since 999 is common in this field -- see
@@ -210,8 +211,8 @@ warnings.filterwarnings("ignore")
 #   NOT windowed either -- this is about who gave THIS diagnosis, not a
 #   downstream-outcome design, so no follow-up time or censoring is involved.
 #
-# STATEMENT 6 (latency): SIX pages, one per non-trauma outcome (psychosis,
-#   bipolar, anxiety, depression, substance, personality), each with 2 panels
+# STATEMENT 6 (latency): SEVEN pages, one per non-trauma outcome (psychosis,
+#   bipolar, anxiety, depression, substance, personality, OCD), each with 2 panels
 #   (Pre-Oct7 / Post-Oct7 entry) -- a histogram of months from trauma entry to
 #   that outcome's first diagnosis, among patients who got it. Not from the
 #   docx -- added as the empirical basis for deciding whether LAG_DAYS is
@@ -230,13 +231,14 @@ warnings.filterwarnings("ignore")
 OCT7 = pd.Timestamp("2023-10-07")
 
 ALL_OUTCOMES = ["psychosis", "bipolar", "ptsd", "asr",
-                "anxiety", "depression", "substance", "personality"]
+                "anxiety", "depression", "substance", "personality", "OCD"]
 
 OUTCOME_COLORS = {
     "psychosis":   "#e63946", "bipolar":     "#457b9d",
     "ptsd":        "#2a9d8f", "asr":         "#e9c46a",
     "anxiety":     "#f4a261", "depression":  "#264653",
     "substance":   "#6d6875", "personality": "#b5838d",
+    "OCD":         "#8ab17d",
 }
 
 AGE_BANDS = {
@@ -257,7 +259,7 @@ TRAUMA_MODES = {
 TRAUMA_EXPOSURE_OUTCOMES, TRAUMA_EXPOSURE_LABEL = TRAUMA_MODES["ptsd_asr"]   # default/initial
 
 # --- Diagnoser mode: any diagnoser (default), psychiatrist only, or non-psychiatrist only ----
-# Applies to EVERY exposure definition in the script (trauma in Statement 1, and all 7
+# Applies to EVERY exposure definition in the script (trauma in Statement 1, and all 8
 # alternate exposures in Statement 2's B1 analysis) -- filters "exposed" to only those whose
 # EARLIEST diagnosis of that exposure was given by a psychiatrist / non-psychiatrist / anyone.
 # Implemented inside first_of() below (the single function every exposure-date lookup goes
@@ -292,10 +294,10 @@ SLIM_RUN = True
 SLIM_AGE_BAND, SLIM_WINDOW, SLIM_DIAGNOSER = "age15_40", "24mo", "any_diagnoser"
 
 # --- Statement 1 & 2: exposure definitions -----------------------------------
-# 7 possible entry exposures (every outcome group can be an "entry" diagnosis). The trauma
+# 8 possible entry exposures (every outcome group can be an "entry" diagnosis). The trauma
 # entry is built dynamically from TRAUMA_EXPOSURE_OUTCOMES/LABEL so it follows the active
-# trauma mode -- call current_alt_exposures_7() rather than a static module dict.
-def current_alt_exposures_7():
+# trauma mode -- call current_alt_exposures() rather than a static module dict.
+def current_alt_exposures():
     return {
         TRAUMA_EXPOSURE_LABEL: TRAUMA_EXPOSURE_OUTCOMES,
         "Depression":  ["depression"],
@@ -304,16 +306,17 @@ def current_alt_exposures_7():
         "Bipolar":     ["bipolar"],
         "Psychosis":   ["psychosis"],
         "Personality": ["personality"],
+        "OCD":         ["OCD"],
     }
 EXPOSURE_COLORS = {
     "PTSD/ASR": "#e63946", "PTSD": "#e63946", "ASR": "#e63946",   # same color, any trauma mode
     "Depression": "#264653", "Anxiety": "#f4a261",
     "Substance": "#6d6875", "Bipolar": "#457b9d", "Psychosis": "#e63946",
-    "Personality": "#b5838d",
+    "Personality": "#b5838d", "OCD": "#8ab17d",
 }
 FOCUS_OUTCOMES = ["psychosis", "bipolar"]     # statement 1 & 2 downstream targets
 S1_DOWNSTREAM  = ["psychosis", "bipolar", "anxiety",
-                  "depression", "substance", "personality"]  # H2's original 6
+                  "depression", "substance", "personality", "OCD"]  # H2's original 6 + OCD
 
 # --- Window mode: WHOLE-YEAR windows only (12 or 24 months) -- deliberately not 18. A window
 # that isn't a whole number of years is NOT seasonally symmetric: a patient entering in January
@@ -525,8 +528,8 @@ PSYCHOSIS_TRANSIENT_CODE = {"F23"}
 
 # --- Statement 5 (who diagnoses what): profession breakdown for EVERY outcome's own first-ever
 # diagnosis (not just the trauma entry), split pre/post Oct7 by that outcome's own date. Needs
-# "profession" metadata for all 8 outcomes, not just the 2 entry ones above -- and period DATES
-# for the 4 outcomes (anxiety/depression/substance/personality) not already covered by
+# "profession" metadata for all 9 outcomes, not just the 2 entry ones above -- and period DATES
+# for the 5 outcomes (anxiety/depression/substance/personality/OCD) not already covered by
 # META_ENTRY_OUTCOMES/META_DOWNSTREAM_OUTCOMES.
 # "profession" is a NUMERIC CODE field, not free text (confirmed from real data -- values like
 # "71.0"/"71" appear for the same code due to float-vs-int formatting upstream, so codes are
@@ -572,6 +575,13 @@ ZONE_COLORS = {"Near Gaza": "#e63946", "Northern Border": "#457b9d",
 
 STATEMENT3_ROSE         = ["total", "ptsd", "asr", "anxiety", "depression"]
 STATEMENT3_DID_NOT_RISE = ["psychosis", "bipolar", "substance", "personality"]
+# The two lists above state a finding. OCD has no result yet: once its post/pre ratio is known,
+# move it into one of them and this section disappears.
+STATEMENT3_NOT_CLASSIFIED = ["OCD"]
+STATEMENT3_SECTIONS = [(label, items) for label, items in [
+    ("ROSE AFTER OCT 7", STATEMENT3_ROSE),
+    ("DID NOT RISE", STATEMENT3_DID_NOT_RISE),
+    ("NOT YET CLASSIFIED", STATEMENT3_NOT_CLASSIFIED)] if items]
 OCT_DEC_YEARS = list(range(2017, 2026))
 
 BASE_COLS = ["patient id", "birth date", "gender",
@@ -598,7 +608,7 @@ PERIOD_VECTOR_COLS = [f"{o}_period{p}_diagnosis_vector"
 PERIOD_PROFESSION_COLS_ALL = [f"{o}_period{p}_profession"
                               for o in OUTCOMES_NEEDING_PROFESSION_COLS for p in PERIODS_RANGE]
 PERIOD_DATE_COLS = [f"{o}_period{p}_start date"
-                    for o in ALL_OUTCOMES for p in PERIODS_RANGE]   # now covers all 8
+                    for o in ALL_OUTCOMES for p in PERIODS_RANGE]   # now covers all 9
 
 NEEDED_COLS = (BASE_COLS + [f"{o}_start date" for o in ALL_OUTCOMES]
               + PERIOD_DATE_COLS + PERIOD_META_COLS + PERIOD_VECTOR_COLS
@@ -619,6 +629,9 @@ def load_frame(input_file, chunksize=100_000):
     missing = [c for c in NEEDED_COLS if c not in available]
     if missing:
         print(f"WARNING: {len(missing)} expected columns not found (will be skipped): {missing}")
+    missing_outcomes = [o for o in ALL_OUTCOMES if f"{o}_start date" not in available]
+    if missing_outcomes:
+        raise RuntimeError(f"{input_file} has no first-ever date for outcomes {missing_outcomes}")
     chunks = pd.read_csv(input_file, encoding="utf-8-sig", usecols=usecols,
                          chunksize=chunksize, low_memory=False)
     return pd.concat(chunks, ignore_index=True)
@@ -696,7 +709,7 @@ def build_frame(df):
                  for o in META_ENTRY_OUTCOMES}
     downstream_meta = {o: get_first_ever_with_meta(df, o, ["diagnosis_vector"])
                        for o in META_DOWNSTREAM_OUTCOMES}
-    # Statement 5: profession at first-ever diagnosis, for ALL 8 outcomes (not just the trauma
+    # Statement 5: profession at first-ever diagnosis, for ALL 9 outcomes (not just the trauma
     # entry ones) -- who diagnoses psychosis/bipolar vs who diagnoses everything else.
     outcome_profession_meta = {o: get_first_ever_with_meta(df, o, ["profession"])
                                for o in ALL_OUTCOMES}
@@ -776,8 +789,8 @@ def first_of_raw(frame, outcome_list):
 
 # --- Who diagnosed the EARLIEST occurrence across outcome_list, for the diagnoser filter ---
 # Mirrors get_exposure_meta_field()'s pooling logic (earliest component wins) but works off
-# outcome_profession_meta (built for all 8 outcomes, not just the 2 trauma ones), so it applies
-# to any of Statement 2's 7 alternate exposures too, not just trauma.
+# outcome_profession_meta (built for all 9 outcomes, not just the 2 trauma ones), so it applies
+# to any of Statement 2's 8 alternate exposures too, not just trauma.
 def _diagnoser_match_mask(frame, outcome_list, raw_dates):
     diagnoser_filter = DIAGNOSER_MODES.get(CURRENT_DIAGNOSER_MODE)
     if diagnoser_filter is None or _current_outcome_profession_meta is None:
@@ -2109,14 +2122,14 @@ def write_statement1_supporting(pdf, frame, entry_meta, downstream_meta, age_lab
 
 
 # =============================================================================
-# PART 2 -- STATEMENT 2: ALTERNATE ENTRY-DIAGNOSIS RR ("B1", extended to 7)
+# PART 2 -- STATEMENT 2: ALTERNATE ENTRY-DIAGNOSIS RR ("B1", extended to 8)
 # =============================================================================
 
 # --- S2, STEP 1: RR for one downstream outcome, across N exposures (windowed, censored) ---
 # Excludes the downstream outcome itself from the exposure set (no self-pairs).
 def compute_b1_raw_rr(frame, downstream_outcome):
     labels, rrs, ns, n_gens = [], [], [], []
-    for exp_label, outcome_list in current_alt_exposures_7().items():
+    for exp_label, outcome_list in current_alt_exposures().items():
         if downstream_outcome in outcome_list:
             continue   # exposure == downstream outcome; skip self-pair
         n_exp, n_gen, comp = compute_exposed_vs_general(frame, outcome_list, [downstream_outcome])
@@ -2141,11 +2154,11 @@ def draw_b1_panel(ax, frame, downstream_outcome, title):
     ax.set_title(title, fontsize=10, fontweight="bold")
 
 
-# --- S2, STEP 3: Pre/post-war RR heatmap across all 7 exposures x 2 focus outcomes ---
+# --- S2, STEP 3: Pre/post-war RR heatmap across all 8 exposures x 2 focus outcomes ---
 def compute_b1_prepost_matrix(frame, entry_side):
     """entry_side: 'pre' or 'post' (Oct 7 diagnosis date of the ENTRY exposure)."""
     rows = []
-    for exp_label, outcome_list in current_alt_exposures_7().items():
+    for exp_label, outcome_list in current_alt_exposures().items():
         downstream = [o for o in FOCUS_OUTCOMES if o not in outcome_list]
         if not downstream:
             continue
@@ -2172,7 +2185,7 @@ def draw_b1_prepost_heatmap(ax, matrix, title):
 
 # --- S2, STEP 3a-bar: Bar-chart version of the pre/post heatmap above -- one panel per
 # downstream outcome (matching the existing FOCUS_OUTCOMES 2-panel convention used elsewhere in
-# Statement 2), X-axis = the 7 alternate exposures, 2 bars each (pre-war IRR, post-war IRR). ---
+# Statement 2), X-axis = the 8 alternate exposures, 2 bars each (pre-war IRR, post-war IRR). ---
 def draw_b1_prepost_bar_panel(ax, pre_matrix, post_matrix, downstream_outcome, title):
     exposures = pre_matrix.index.tolist()
     post_aligned = post_matrix.reindex(exposures)
@@ -2256,20 +2269,20 @@ def draw_b1_prepost_change_heatmap(ax, change_matrix, title):
 TRAUMA_DX_KEY = "trauma_dx"
 
 
-def s2_targets_7(frame):
-    """(label, downstream key, component outcomes) for the 7 second diagnoses, trauma first."""
+def s2_targets(frame):
+    """(label, downstream key, component outcomes) for the 8 second diagnoses, trauma first."""
     if f"first_{TRAUMA_DX_KEY}" not in frame.columns:
         frame[f"first_{TRAUMA_DX_KEY}"] = first_of_raw(frame, TRAUMA_EXPOSURE_OUTCOMES)
     return [(label, TRAUMA_DX_KEY if outcomes == TRAUMA_EXPOSURE_OUTCOMES else outcomes[0], outcomes)
-            for label, outcomes in current_alt_exposures_7().items()]
+            for label, outcomes in current_alt_exposures().items()]
 
 
 def compute_s2_full_matrices(frame):
     """Returns (overall, pre, post): DataFrames indexed by entry-diagnosis label, columns n_exp,
     n_gen + one IRR column per downstream key. NaN on the diagonal (self-pair)."""
-    targets = s2_targets_7(frame)
+    targets = s2_targets(frame)
     overall, pre, post = [], [], []
-    for exp_label, exp_outcomes in current_alt_exposures_7().items():
+    for exp_label, exp_outcomes in current_alt_exposures().items():
         downs = [key for _, key, comps in targets if comps != exp_outcomes]
         n_exp, n_gen, comp = compute_exposed_vs_general(frame, exp_outcomes, downs)
         row = {"exposure": exp_label, "n_exp": n_exp, "n_gen": n_gen}
@@ -2327,7 +2340,7 @@ def draw_s2_overall_bar_panel(ax, overall, downstream_key, title):
 
 
 def write_statement2_extended(pdf, frame, age_label):
-    targets = s2_targets_7(frame)
+    targets = s2_targets(frame)
     overall, pre, post = compute_s2_full_matrices(frame)
     win = FIXED_WINDOW_DAYS // 30
 
@@ -2364,7 +2377,7 @@ def write_statement2_extended(pdf, frame, age_label):
 
     # bar charts for the second diagnoses slides 22/24 don't show -- 2 per page
     labels = {key: label for label, key, _ in targets}
-    remaining = [key for key in ["anxiety", "depression", "substance", "personality", TRAUMA_DX_KEY]
+    remaining = [key for key in ["anxiety", "depression", "substance", "personality", "OCD", TRAUMA_DX_KEY]
                  if key in labels]
     pages = [remaining[i:i + 2] for i in range(0, len(remaining), 2)]
     for keys_on_page in pages:
@@ -2416,7 +2429,7 @@ def comorb_state_labels(x_label):
 
 def comorb_x_list(outcome):
     """The other diagnoses X paired with trauma for this outcome: (label, outcome key)."""
-    return [(label, outs[0]) for label, outs in current_alt_exposures_7().items()
+    return [(label, outs[0]) for label, outs in current_alt_exposures().items()
             if outs != TRAUMA_EXPOSURE_OUTCOMES and outs[0] != outcome]
 
 
@@ -2637,7 +2650,7 @@ def zone_populations(frame):
     return frame["zone"].value_counts().reindex(ZONE_ORDER).fillna(0)
 
 
-# --- S3, STEP 2: Quarterly first-ever counts per zone for one item ('total' = all 8) ---
+# --- S3, STEP 2: Quarterly first-ever counts per zone for one item ('total' = all 9) ---
 def quarterly_counts(frame, item, group_col="zone", groups=ZONE_ORDER):
     q_index = pd.period_range("2017Q1", "2026Q2", freq="Q")
     outcomes = ALL_OUTCOMES if item == "total" else [item]
@@ -2709,10 +2722,9 @@ def write_statement3(pdf, frame, age_label):
     person_years = quarterly_person_years(frame, q_index)
     oct7_pos = next(i for i, q in enumerate(q_index) if q == pd.Period("2023Q4", freq="Q"))
 
-    for section_label, items in [("ROSE AFTER OCT 7", STATEMENT3_ROSE),
-                                 ("DID NOT RISE", STATEMENT3_DID_NOT_RISE)]:
+    for section_label, items in STATEMENT3_SECTIONS:
         for item in items:
-            label = "ALL 8 OUTCOMES" if item == "total" else item.upper()
+            label = "ALL 9 OUTCOMES" if item == "total" else item.upper()
             rate = to_rate_per_1000_py(quarterly_counts(frame, item), person_years)
             fig, ax = plt.subplots(figsize=(13, 5.5))
             draw_rate_panel(ax, rate, oct7_pos,
@@ -2755,8 +2767,7 @@ def write_statement3_by_distance(pdf, frame, age_label):
     shown = [b for b in DIST_BAND_LABELS if person_years[b].sum() > 0]
     year_ticks = [i for i, q in enumerate(q_index) if q.quarter == 1]
 
-    for section_label, items in [("ROSE AFTER OCT 7", STATEMENT3_ROSE),
-                                 ("DID NOT RISE", STATEMENT3_DID_NOT_RISE)]:
+    for section_label, items in STATEMENT3_SECTIONS:
         fig, axes = plt.subplots(3, 2, figsize=(15, 13))
         fig.suptitle(f"STATEMENT 3 | {section_label} | by distance from Gaza (Northern Border "
                      f"excluded) | New dx per 1,000 person-years | Quarterly | {age_label}",
@@ -2776,7 +2787,7 @@ def write_statement3_by_distance(pdf, frame, age_label):
             ax.set_xlabel("post/pre -> " + " | ".join(f"{b}: x{ratio[b]:.2f}" for b in shown
                                                       if pd.notna(ratio[b])), fontsize=7)
             ax.set_ylabel("per 1,000 person-years", fontsize=8)
-            ax.set_title("ALL 8 OUTCOMES" if item == "total" else item.upper(),
+            ax.set_title("ALL 9 OUTCOMES" if item == "total" else item.upper(),
                          fontsize=10, fontweight="bold")
             ax.legend(fontsize=7, loc="upper left", ncol=3)
         for ax in list(axes.flat)[len(items):]:
@@ -2850,7 +2861,7 @@ def print_profession_diagnostic(outcome_meta):
          " much the two treatments differ before picking one for the final presentation.")
 
 
-# --- S5, STEP 2: Draw one side's panel -- all 8 outcomes, % diagnosed by a psychiatrist ---
+# --- S5, STEP 2: Draw one side's panel -- all 9 outcomes, % diagnosed by a psychiatrist ---
 def draw_profession_specialist_panel(ax, outcome_meta, side, title, treat_missing_as_nonpsychiatrist):
     pcts, ns = [], []
     for outcome in ALL_OUTCOMES:
@@ -2896,8 +2907,8 @@ def write_statement5(pdf, outcome_meta, age_label):
 # UNRESTRICTED by window_days/WINDOW_MODES on purpose -- this only exists to show the empirical
 # shape of the latency distribution, so capping it at the window would hide exactly the
 # information (long delays, or how much mass sits outside any given window) it exists to reveal.
-# One page per NON-trauma outcome (6 pages: psychosis, bipolar, anxiety, depression, substance,
-# personality), each with 2 panels (Pre-Oct7 entry / Post-Oct7 entry).
+# One page per NON-trauma outcome (7 pages: psychosis, bipolar, anxiety, depression, substance,
+# personality, OCD), each with 2 panels (Pre-Oct7 entry / Post-Oct7 entry).
 # =============================================================================
 
 LATENCY_BINS_MONTHS = [(0, 1), (1, 3), (3, 6), (6, 12), (12, 24), (24, 36), (36, np.inf)]
@@ -2930,9 +2941,9 @@ def draw_latency_panel(ax, frame, downstream_outcome, side, title):
     ax.set_title(title, fontsize=10, fontweight="bold")
 
 
-# --- S6, STEP 3: Write one page per non-trauma outcome (6 pages), Pre/Post panels each ---
+# --- S6, STEP 3: Write one page per non-trauma outcome (7 pages), Pre/Post panels each ---
 def write_statement6(pdf, frame, age_label):
-    for outcome in S1_DOWNSTREAM:   # psychosis, bipolar, anxiety, depression, substance, personality
+    for outcome in S1_DOWNSTREAM:   # psychosis, bipolar, anxiety, depression, substance, personality, OCD
         fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
         fig.suptitle(f"STATEMENT 6 | Latency: months from {TRAUMA_EXPOSURE_LABEL} entry to "
                     f"first {outcome.upper()} | {age_label}\n"
@@ -3081,7 +3092,7 @@ def draw_trauma_composition_panel(ax, pre, post, show_stats=True):
 # time). If post-war patients have LESS prior history than pre-war ones, that supports "war
 # trauma captures a broader, less pre-selected population" rather than "the same people who
 # were already engaged with mental health services." ---
-PRIOR_HISTORY_OUTCOMES = ["anxiety", "depression", "substance", "personality", "psychosis", "bipolar"]
+PRIOR_HISTORY_OUTCOMES = ["anxiety", "depression", "substance", "personality", "OCD", "psychosis", "bipolar"]
 
 def has_any_prior_history(sub):
     entry = first_of(sub, TRAUMA_EXPOSURE_OUTCOMES)
@@ -3803,14 +3814,14 @@ def write_adjusted_forest_pages(pdf, frame, age_label):
     fig.subplots_adjust(wspace=0.55)
     pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
 
-    # --- page 3: all 7 entry exposures (Statement 2), crude vs adjusted, one model each ---
+    # --- page 3: all 8 entry exposures (Statement 2), crude vs adjusted, one model each ---
     fig, axes = plt.subplots(1, 2, figsize=(15, 8))
     fig.suptitle(f"ADJUSTED IRR | all entry diagnoses (Statement 2), each vs its own general "
                  f"population | crude vs adjusted | {age_label}\n{adj_note}",
                  fontsize=9.5, fontweight="bold")
     for ax, outcome in zip(axes, FOCUS_OUTCOMES):
         rows = []
-        for exp_label, outcome_list in current_alt_exposures_7().items():
+        for exp_label, outcome_list in current_alt_exposures().items():
             if outcome in outcome_list:
                 continue   # exposure == outcome; skip self-pair (as in B1)
             res = adjusted_irr_results(frame, outcome_list, outcome) if outcome_list != TRAUMA_EXPOSURE_OUTCOMES \
@@ -4567,7 +4578,7 @@ def desc_patient_level_page(pdf, frame, age_label):
 
 def desc_statement2_page(pdf, frame, age_label):
     rows = {}
-    for exp_label, outcome_list in current_alt_exposures_7().items():
+    for exp_label, outcome_list in current_alt_exposures().items():
         entry = first_of(frame, outcome_list)
         r = {"exposed": int(entry.notna().sum()),
              "before Oct 7": int((entry < OCT7).sum()), "on/after Oct 7": int((entry >= OCT7).sum())}
@@ -5057,7 +5068,7 @@ def _run_sanity_checks_body(frame_full, entry_meta_full, downstream_meta_full, o
               and not bool((y <= OCT7).any()), f"n={len(cr):,}, events={int(cr['events'].sum())}")
 
     # --- 12. Informational only (data hypotheses, not code-correctness -- printed, not asserted) --
-    for item in STATEMENT3_ROSE + STATEMENT3_DID_NOT_RISE:
+    for item in STATEMENT3_ROSE + STATEMENT3_DID_NOT_RISE + STATEMENT3_NOT_CLASSIFIED:
         pass   # Statement 3's own charts already show post/pre ratios directly; nothing extra
               # to compute here without re-deriving the whole quarterly pipeline redundantly.
     info("TEST 2b vs H2 rate_pre", "expected to be in the same ballpark (H2 pools pre+post; "
