@@ -100,29 +100,49 @@ def find_duplicate_columns(path, protected_names, outcomes):
     return header, duplicates, n_rows
 
 
+def normalize_id(values):
+    """'0x' + upper-case hex, whatever surrounds it or its letter case; NaN when there is none."""
+    return "0x" + values.str.extract(r"0[xX]([0-9A-Fa-f]+)", expand=False).str.upper()
+
+
 # --- STEP 2: Membership periods per patient, merged and cut to the cohort time ---
 def read_membership_periods(path):
+    header = list(pd.read_csv(path, encoding=ENCODING, nrows=0).columns)
+    missing_cols = [c for c in (SOURCE_ID_COL, SOURCE_START_COL, SOURCE_END_COL) if c not in header]
+    if missing_cols:
+        raise RuntimeError(f"Membership file has no column(s) {missing_cols}. Its columns: {header}")
+
     parts = []
-    n_rows = n_bad = 0
+    n_rows = 0
+    failures = {"no 0x id": [0, []], "bad start date": [0, []], "bad end date": [0, []]}
     reader = pd.read_csv(path, encoding=ENCODING, dtype=str, keep_default_na=False,
                          usecols=[SOURCE_ID_COL, SOURCE_START_COL, SOURCE_END_COL],
                          chunksize=1_000_000)
     for chunk in reader:
         n_rows += len(chunk)
         period = pd.DataFrame({
-            "id": chunk[SOURCE_ID_COL].str.extract(r"(0x[0-9A-Fa-f]+)", expand=False),
+            "id": normalize_id(chunk[SOURCE_ID_COL]),
             "start": pd.to_datetime(chunk[SOURCE_START_COL].str.strip().str[:10],
                                     format=DATE_FORMAT, errors="coerce"),
             "end": pd.to_datetime(chunk[SOURCE_END_COL].str.strip().str[:10],
                                   format=DATE_FORMAT, errors="coerce"),
         })
-        bad = period.isna().any(axis=1)
-        n_bad += int(bad.sum())
-        parts.append(period[~bad])
+        for reason, field, raw_col in [("no 0x id", "id", SOURCE_ID_COL),
+                                       ("bad start date", "start", SOURCE_START_COL),
+                                       ("bad end date", "end", SOURCE_END_COL)]:
+            failed = period[field].isna()
+            failures[reason][0] += int(failed.sum())
+            if len(failures[reason][1]) < 3:
+                failures[reason][1] += chunk.loc[failed, raw_col].head(3).tolist()
+        parts.append(period.dropna())
     periods = pd.concat(parts, ignore_index=True)
     print(f"Membership file: {n_rows:,} rows, {periods['id'].nunique():,} patients")
-    if n_bad:
-        print(f"  WARNING: {n_bad:,} rows skipped (missing id, or start/end not DD/MM/YYYY)")
+    for reason, (n_failed, examples) in failures.items():
+        if n_failed:
+            print(f"  WARNING: {n_failed:,} rows skipped, {reason}. "
+                  f"Examples: {examples[:3]}")
+    if periods.empty:
+        raise RuntimeError("No usable membership rows. See the skipped-row examples above.")
 
     rows_per_patient = periods.groupby("id").size()
     n_at_limit = int((rows_per_patient >= EXTRACTION_LIMIT).sum())
@@ -139,7 +159,22 @@ def read_membership_periods(path):
     merged = periods.groupby("block").agg(id=("id", "first"), start=("start", "min"), end=("end", "max"))
 
     in_cohort = (merged["start"] <= COHORT_END) & (merged["end"] >= COHORT_START)
+    print(f"  {merged.loc[in_cohort, 'id'].nunique():,} patients have a period overlapping "
+          f"{COHORT_START:%d/%m/%Y}-{COHORT_END:%d/%m/%Y}")
     return merged[in_cohort].reset_index(drop=True)
+
+
+def check_ids_match(summary):
+    """Stops before the long passes if the cohort's patient ids don't match the membership ids."""
+    raw_ids = pd.read_csv(INPUT_FILE, encoding=ENCODING, dtype=str, keep_default_na=False,
+                          usecols=[PATIENT_ID_COL])[PATIENT_ID_COL]
+    matched = int(normalize_id(raw_ids).isin(summary.index).sum())
+    print(f"Cohort patients found in the membership periods: {matched:,} of {len(raw_ids):,} "
+          f"({matched / len(raw_ids):.1%})")
+    if matched == 0:
+        print(f"  cohort '{PATIENT_ID_COL}' examples:   {raw_ids.head(3).tolist()}")
+        print(f"  membership id examples (cleaned): {summary.index[:3].tolist()}")
+        raise RuntimeError("No patient matched the membership file. Compare the id examples above.")
 
 
 def summarize_periods(periods):
@@ -158,7 +193,7 @@ def summarize_periods(periods):
 
 
 def add_memberships(chunk, summary):
-    found = summary.reindex(chunk[PATIENT_ID_COL].str.strip())
+    found = summary.reindex(normalize_id(chunk[PATIENT_ID_COL]))
     has_period = found[MULTIPLE_COL].notna().to_numpy()
     for col, value_col in [(MEMBERSHIP_START_COL, "first_start"), (MEMBERSHIP_END_COL, "last_end")]:
         if col not in chunk.columns:
@@ -173,7 +208,12 @@ def main():
     protected_names, outcomes = columns_script_c_reads()
     protected_names |= {PATIENT_ID_COL, MEMBERSHIP_START_COL, MEMBERSHIP_END_COL}
 
-    print(f"Finding duplicate columns in {INPUT_FILE}...")
+    # Membership first: a mismatch stops the run in minutes, not after the full passes
+    print(f"Reading membership periods from {MEMBERSHIP_FILE}...")
+    summary = summarize_periods(read_membership_periods(MEMBERSHIP_FILE))
+    check_ids_match(summary)
+
+    print(f"\nFinding duplicate columns in {INPUT_FILE}...")
     header, duplicates, n_input_rows = find_duplicate_columns(INPUT_FILE, protected_names, outcomes)
     for col, same_as in duplicates.items():
         print(f"  Dropping '{col}' (same content as '{same_as}')")
@@ -184,9 +224,6 @@ def main():
     for col in (MEMBERSHIP_START_COL, MEMBERSHIP_END_COL):
         if col not in kept_columns:
             print(f"  NOTE: '{col}' not in the input, it will be added")
-
-    print(f"\nReading membership periods from {MEMBERSHIP_FILE}...")
-    summary = summarize_periods(read_membership_periods(MEMBERSHIP_FILE))
 
     partial_path = OUTPUT_FILE + ".partial"
     counts = {"0": 0, "multiple": 0, "-1": 0}
@@ -213,8 +250,6 @@ def main():
     print(f"   0 (1 period):            {counts['0']:,}")
     print(f"   2+ periods:              {counts['multiple']:,}")
     print(f"  -1 (no period 2017-2026): {counts['-1']:,}")
-    if counts["-1"] == n_written:
-        raise RuntimeError("No patient matched the membership file. Check the patient id format.")
     print(f"\nSaved to: {OUTPUT_FILE}")
 
 
@@ -224,7 +259,7 @@ def main():
 FOLDER          = r"\\10.100.117.220\Projects$\R12-MHRC\Psychosis_Oct7_6Year_Amir\sagifolder\OutPutWorkingFiles\PsychosisPostWar"
 INPUT_FILE      = os.path.join(FOLDER, "matched_cohort_PeriodOutComes.csv")
 OUTPUT_FILE     = os.path.join(FOLDER, "matched_cohort_PeriodOutComes_Membership.csv")
-MEMBERSHIP_FILE = r"\\10.100.117.220\Projects$\R12-MHRC\Psychosis_Oct7_6Year_Amir\sagifolder\RawData\MetaDataMemberships_Full.csv"
+MEMBERSHIP_FILE = r"\\10.100.117.220\Projects$\R12-MHRC\Psychosis_Oct7_6Year_Amir\sagifolder\RawData\MetaData\Memberships_Full.csv"
 
 if __name__ == "__main__":
     main()
