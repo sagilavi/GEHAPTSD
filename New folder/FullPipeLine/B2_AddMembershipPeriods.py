@@ -17,7 +17,8 @@ import pandas as pd
 #        - the patient id and membership columns this step writes
 #   2. Reads the membership file (one row per membership period, at most the
 #      first 150 per patient), merges periods that overlap or are back to back
-#      (gap of 1 day or less), and keeps the ones that overlap the cohort time.
+#      (gap of 1 day or less), removes periods shorter than Min_Period_Duration
+#      days, and keeps the ones that overlap the cohort time.
 #   3. Adds MultipleMemberships:
 #        0  -> exactly 1 period; membership start/end are set to that period
 #        "start-end:start-end:..." -> more than 1 period; membership start/end
@@ -35,6 +36,7 @@ import pandas as pd
 COHORT_START = pd.Timestamp("2017-01-01")
 COHORT_END   = pd.Timestamp("2026-06-30")   # = STUDY_END in script C
 MAX_MERGE_GAP_DAYS = 1
+Min_Period_Duration = 30   # days; shorter periods (after merging) are removed before the analysis
 EXTRACTION_LIMIT   = 150   # the membership extract holds at most this many periods per patient
 
 CHUNK_ROWS = 100_000
@@ -165,6 +167,11 @@ def read_membership_periods(path):
     starts_new = previous_end.isna() | (periods["start"] > previous_end + pd.Timedelta(days=MAX_MERGE_GAP_DAYS))
     periods["block"] = starts_new.cumsum()
     merged = periods.groupby("block").agg(id=("id", "first"), start=("start", "min"), end=("end", "max"))
+
+    too_short = (merged["end"] - merged["start"]).dt.days < Min_Period_Duration
+    print(f"  {int(too_short.sum()):,} of {len(merged):,} merged periods removed "
+          f"(shorter than {Min_Period_Duration} days)")
+    merged = merged[~too_short]
 
     in_cohort = (merged["start"] <= COHORT_END) & (merged["end"] >= COHORT_START)
     print(f"  {merged.loc[in_cohort, 'id'].nunique():,} patients have a period overlapping "
