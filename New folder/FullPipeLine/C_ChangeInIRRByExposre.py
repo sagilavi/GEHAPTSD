@@ -410,13 +410,15 @@ def set_followup(frame):
           f"are left out of person-time")
 
 
-def member_days(start, end):
+def member_days(start, end, gaps=None):
     """Days from start to end (per patient, index-aligned Series) minus the days that fall in a
-    membership gap. Negative/NaT behave as end - start does, so callers clip as before."""
+    membership gap. Negative/NaT behave as end - start does, so callers clip as before.
+    `gaps` defaults to the loaded patients' gaps (the sanity checks pass their own)."""
     days = (end - start).dt.days
-    if _membership_gaps is None or _membership_gaps.empty:
+    gaps = _membership_gaps if gaps is None else gaps
+    if gaps is None or gaps.empty:
         return days
-    gaps = _membership_gaps[_membership_gaps.index.isin(start.index)]
+    gaps = gaps[gaps.index.isin(start.index)]
     if gaps.empty:
         return days
     s, e = start.reindex(gaps.index), end.reindex(gaps.index)
@@ -4969,6 +4971,60 @@ def run_sanity_checks(frame_full, entry_meta_full, downstream_meta_full, outcome
         print(f"\nSanity check report saved to: {report_path}")
 
 
+def _check_membership_gap_logic(frame, gaps, all_days, kept_days, check, sample_size=5000):
+    """1d. Re-checks the membership-gap person-time with a separate, simpler calculation."""
+    t = pd.Timestamp
+    # (a) the worked example: member 1.1.2017-1.1.2018 and 1.1.2019-1.1.2020 -> 2 years
+    example = parse_membership_gaps(pd.Series(["01/01/2017-01/01/2018:01/01/2019-01/01/2020"], index=["ex"]))
+    ex_days = int(member_days(pd.Series(t("2017-01-01"), index=["ex"]), pd.Series(t("2020-01-01"), index=["ex"]),
+                              gaps=example).iloc[0])
+    check("example: member 1.1.2017-1.1.2018 + 1.1.2019-1.1.2020 counts 730 days (2 years), not 1,095",
+          ex_days == 730, f"got {ex_days}")
+
+    # (b) one period, or none: person-time is exactly as before the change
+    has_gap = frame.index.isin(gaps.index)
+    check("patients without a gap: member days = calendar days",
+          bool((kept_days[~has_gap] == all_days[~has_gap]).all()),
+          f"{int((kept_days[~has_gap] != all_days[~has_gap]).sum()):,} differ")
+
+    periods_text = frame[MEMBERSHIP_PERIODS_COL].astype(str) if MEMBERSHIP_PERIODS_COL in frame.columns \
+        else pd.Series("", index=frame.index)
+    several = periods_text.str.contains(":")
+    check("every patient with several membership periods has a gap", bool(has_gap[several.values].all()),
+          f"{int((~has_gap[several.values]).sum()):,} without")
+    if not several.any():
+        return
+
+    # (c) fu_end = the last period's end (capped at STUDY_END) -- B2 output read with the right date order
+    last_end = pd.to_datetime(periods_text[several].str.split(":").str[-1].str.split("-").str[-1],
+                              format="%d/%m/%Y", errors="coerce").clip(upper=STUDY_END)
+    differ = frame.loc[several, "fu_end"] != last_end
+    check("several periods: fu_end = last membership end (capped at STUDY_END)", not bool(differ.any()),
+          f"{int(differ.sum()):,} of {int(several.sum()):,} differ")
+
+    # (d) separate calculation on a sample: days inside [fu_start, fu_end] covered by
+    # (before the first period) + each period + (after the last period)
+    rows = frame.index[several.values & has_gap][:sample_size]
+
+    def covered_days(text, start, end):
+        periods = sorted(tuple(pd.to_datetime(p.split("-"), format="%d/%m/%Y")) for p in text.split(":"))
+        covered = [(t.min, periods[0][0])] + periods + [(periods[-1][1], t.max)]
+        return sum(max(0, (min(end, e) - max(start, s)).days) for s, e in covered)
+
+    expected = pd.Series([covered_days(periods_text[r], frame.at[r, "fu_start"], frame.at[r, "fu_end"])
+                          for r in rows], index=rows)
+    differ = expected != kept_days[rows]
+    check(f"person-time matches a separate period-by-period calculation ({len(rows):,} patients with a gap)",
+          not bool(differ.any()), f"{int(differ.sum()):,} differ")
+
+    # (e) the KM pieces add up to the same member days
+    piece_rows, piece_start, piece_end, _ = membership_pieces(frame.loc[rows, "fu_start"], frame.loc[rows, "fu_end"])
+    piece_days = pd.Series((piece_end - piece_start).dt.days.clip(lower=0).values, index=piece_rows)
+    piece_days = piece_days.groupby(level=0).sum().reindex(rows, fill_value=0)
+    differ = piece_days != kept_days[rows]
+    check("KM curve pieces add up to the member days", not bool(differ.any()), f"{int(differ.sum()):,} differ")
+
+
 def _run_sanity_checks_body(frame_full, entry_meta_full, downstream_meta_full, outcome_profession_meta_full):
     print("\n" + "=" * 70)
     print("AUTOMATED SANITY CHECKS")
@@ -5023,6 +5079,7 @@ def _run_sanity_checks_body(frame_full, entry_meta_full, downstream_meta_full, o
         in_gap = dates.gt(gaps["gap_start"], axis=0) & dates.lt(gaps["gap_end"], axis=0)
         info("first-ever diagnoses dated inside a membership gap (still counted as events)",
              f"{int(in_gap.values.sum()):,}")
+    _check_membership_gap_logic(frame, gaps, all_days, kept_days, check)
 
     # --- 2. zone_populations sums to len(frame), for every age band (exhaustive/mutually
     # exclusive zone assignment -- nobody should be silently dropped) ---
