@@ -344,6 +344,7 @@ REGISTRY_START = pd.Timestamp("2017-01-01")   # earliest point with data -- star
 #   fu_end = earliest of ("cohort reference event-membership end date", STUDY_END)
 #            (2079-06-06 = still a member, capped at STUDY_END; missing -> STUDY_END)
 #   fu_start = later of (REGISTRY_START, 15th birthday) -- only the END comes from membership.
+#   Days between two membership periods are not person-time -- see MEMBERSHIP GAPS below.
 # Rules, applied to EVERY person-time calculation below:
 #   - EXPOSED: at risk from the exposure (PTSD/ASR) date until the EARLIEST of -- the downstream
 #     diagnosis, entry + FIXED_WINDOW_DAYS, fu_end. A first-ever exposure before the 15th
@@ -359,10 +360,101 @@ MEMBERSHIP_END_COL   = "cohort reference event-membership end date"
 FOLLOWUP_MIN_AGE     = 15
 _followup_end = None   # per-patient fu_end Series (full-population index), set by set_followup()
 
+# --- MEMBERSHIP GAPS: only days as a member count as person-time ----------------------------
+# Patients leave Clalit and come back. Step B2 lists each patient's membership periods in
+# 2017-2026 in MultipleMemberships ("0" = one period, "start-end:start-end:..." = several,
+# "-1" = none). Every person-time calculation goes through member_days(), which removes the
+# days between two periods: member 1.1.2017-1.1.2018 and 1.1.2019-1.1.2020 -> 2 years, not 3.
+# Follow-up still starts at fu_start and ends at fu_end (= the last membership end) as above;
+# windows stay calendar windows (a gap inside one is not counted, the window is not extended).
+# A diagnosis dated inside a gap is still counted as an event (see the sanity checks).
+MEMBERSHIP_PERIODS_COL = "MultipleMemberships"
+_membership_gaps = None      # DataFrame indexed by frame row: gap_start, gap_end
+_gaps_by_patient = {}        # same gaps, {frame row: [(gap_start, gap_end), ...]}
+
+
+def parse_membership_gaps(periods_text):
+    """Gaps between consecutive membership periods, one row per gap, indexed by frame row."""
+    multi = periods_text.dropna().astype(str)
+    multi = multi[multi.str.contains(":")]
+    if multi.empty:
+        return pd.DataFrame({"gap_start": pd.Series(dtype="datetime64[ns]"),
+                             "gap_end": pd.Series(dtype="datetime64[ns]")})
+    pieces = multi.str.split(":").explode()
+    bounds = pieces.str.split("-", expand=True)
+    periods = pd.DataFrame({"start": pd.to_datetime(bounds[0], format="%d/%m/%Y", errors="coerce"),
+                            "end": pd.to_datetime(bounds[1], format="%d/%m/%Y", errors="coerce")},
+                           index=pieces.index).dropna()
+    periods = periods.reset_index().sort_values(["index", "start"]).set_index("index")
+    next_start = periods.groupby(level=0)["start"].shift(-1)
+    gaps = pd.DataFrame({"gap_start": periods["end"], "gap_end": next_start}).dropna()
+    gaps.index.name = None
+    return gaps[gaps["gap_end"] > gaps["gap_start"]]
+
 
 def set_followup(frame):
-    global _followup_end
+    global _followup_end, _membership_gaps, _gaps_by_patient
     _followup_end = frame["fu_end"]
+    if MEMBERSHIP_PERIODS_COL in frame.columns:
+        _membership_gaps = parse_membership_gaps(frame[MEMBERSHIP_PERIODS_COL])
+    else:
+        print(f"WARNING: '{MEMBERSHIP_PERIODS_COL}' not found -- gaps between membership periods "
+              f"are counted as follow-up (run step B2 first)")
+        _membership_gaps = parse_membership_gaps(pd.Series(dtype=object))
+    _gaps_by_patient = {}
+    for row, gap_start, gap_end in zip(_membership_gaps.index, _membership_gaps["gap_start"],
+                                       _membership_gaps["gap_end"]):
+        _gaps_by_patient.setdefault(row, []).append((gap_start, gap_end))
+    n_patients = _membership_gaps.index.nunique()
+    print(f"Membership gaps: {len(_membership_gaps):,} gaps in {n_patients:,} patients "
+          f"are left out of person-time")
+
+
+def member_days(start, end):
+    """Days from start to end (per patient, index-aligned Series) minus the days that fall in a
+    membership gap. Negative/NaT behave as end - start does, so callers clip as before."""
+    days = (end - start).dt.days
+    if _membership_gaps is None or _membership_gaps.empty:
+        return days
+    gaps = _membership_gaps[_membership_gaps.index.isin(start.index)]
+    if gaps.empty:
+        return days
+    s, e = start.reindex(gaps.index), end.reindex(gaps.index)
+    overlap_start = s.where(s > gaps["gap_start"], gaps["gap_start"])
+    overlap_end = e.where(e < gaps["gap_end"], gaps["gap_end"])
+    lost = (overlap_end - overlap_start).dt.days.clip(lower=0).groupby(level=0).sum()
+    return days - lost.reindex(days.index, fill_value=0)
+
+
+def member_days_one(row, start, end):
+    """member_days() for a single patient (for the per-patient loops)."""
+    days = (end - start).days
+    for gap_start, gap_end in _gaps_by_patient.get(row, ()):
+        days -= max(0, (min(end, gap_end) - max(start, gap_start)).days)
+    return days
+
+
+def membership_pieces(start, end):
+    """Splits each patient's [start, end] at their membership gaps. Returns (row, start, end,
+    is_last) arrays, one entry per piece; patients without a gap keep one piece."""
+    rows, starts, ends, last = [], [], [], []
+    for row, s, e in zip(start.index, start, end):
+        pieces = [(s, e)]
+        for gap_start, gap_end in _gaps_by_patient.get(row, ()):
+            split = []
+            for p_start, p_end in pieces:
+                if gap_end <= p_start or gap_start >= p_end:
+                    split.append((p_start, p_end))
+                    continue
+                if gap_start > p_start:
+                    split.append((p_start, gap_start))
+                if gap_end < p_end:
+                    split.append((gap_end, p_end))
+            pieces = split or [(s, s)]
+        for i, (p_start, p_end) in enumerate(pieces):
+            rows.append(row); starts.append(p_start); ends.append(p_end); last.append(i == len(pieces) - 1)
+    return (np.array(rows), pd.to_datetime(pd.Series(starts)), pd.to_datetime(pd.Series(ends)),
+            np.array(last, dtype=bool))
 
 
 def followup_end_for(index):
@@ -406,7 +498,7 @@ def person_time_events_and_years(entry_dates, event_dates, window_days=None, lag
     (this script only has first-ever dates, not recurrences, so there is no later event to
     still count for them)."""
     entry, end_time, is_event, _ = exposed_intervals(entry_dates, event_dates, window_days, lag_days)
-    days_at_risk = (end_time - entry).dt.days.clip(lower=0)
+    days_at_risk = member_days(entry, end_time).clip(lower=0)
     person_years = days_at_risk.sum() / 365.25
     n_events = int(is_event.sum())
     return n_events, person_years
@@ -476,7 +568,7 @@ def compute_general_lexis_split(frame, exposure_outcomes, downstream_outcome, pe
     for label, p_start, p_end in periods:
         seg_start = gen_start.clip(lower=p_start)
         overlap_end = end_time.clip(upper=p_end)
-        days = (overlap_end - seg_start).dt.days.clip(lower=0)
+        days = member_days(seg_start, overlap_end).clip(lower=0)
         person_years = (days / 365.25).sum()
         n_events = int((is_event & (down >= p_start) & (down < p_end)).sum())
         rate = (n_events / person_years * 1000) if person_years > 0 else np.nan
@@ -595,7 +687,7 @@ BASE_COLS = ["patient id", "birth date", "gender",
              "mailing language", "demographics_2023-insurance type",
              "charlson - lastuntil2023-charlson score total",
              # --- follow-up (membership) window -- see FOLLOW-UP END below ---
-             MEMBERSHIP_END_COL]
+             MEMBERSHIP_END_COL, MEMBERSHIP_PERIODS_COL]
 # Period-level columns needed for the Statement-1 supporting tests (2b uses the collapsed
 # "_start date" cols already in BASE; 5/9 need entry meta, 6 needs the downstream
 # diagnosis_vector) PLUS Statement 5, which needs "profession" for every outcome and
@@ -686,7 +778,8 @@ def build_frame(df):
 
     # --- Follow-up window (see FOLLOW-UP END near the top of the file) ---
     if MEMBERSHIP_END_COL in df.columns:
-        membership_end = pd.to_datetime(df[MEMBERSHIP_END_COL], errors="coerce")
+        # DD/MM/YYYY text (steps A and B2) -- without dayfirst, 27/11/2023 would become NaT
+        membership_end = pd.to_datetime(df[MEMBERSHIP_END_COL], errors="coerce", dayfirst=True)
     else:
         print(f"WARNING: '{MEMBERSHIP_END_COL}' not found -- follow-up runs to STUDY_END for "
               f"everyone (membership end NOT taken into account)")
@@ -697,6 +790,7 @@ def build_frame(df):
     frame["age15_date"] = age15_date   # NaT = unknown birth date
     frame["fu_start"] = age15_date.where(age15_date > REGISTRY_START, REGISTRY_START)
     frame["fu_end"] = membership_end.fillna(STUDY_END).clip(upper=STUDY_END).values   # 2079-06-06 = active
+    frame[MEMBERSHIP_PERIODS_COL] = df.get(MEMBERSHIP_PERIODS_COL, pd.Series(index=df.index)).values
 
     for outcome in ALL_OUTCOMES:
         col = f"{outcome}_start date"
@@ -1478,15 +1572,15 @@ def split_person_time_by_period(entry_dates, event_dates, window_days, periods):
     events_by_label = {label: 0 for label, _, _ in periods}
     py_by_label = {label: 0.0 for label, _, _ in periods}
 
+    for label, p_start, p_end in periods:
+        seg_start = entry.where(entry > p_start, p_start)
+        seg_end = end_time.where(end_time < p_end, p_end)
+        py_by_label[label] += member_days(seg_start, seg_end).clip(lower=0).sum() / 365.25
+
     for pid in entry.index:
         e_start, e_end = entry.loc[pid], end_time.loc[pid]
         if pd.isna(e_start) or pd.isna(e_end) or e_end <= e_start:
             continue
-        for label, p_start, p_end in periods:
-            seg_start = max(e_start, p_start)
-            seg_end = min(e_end, p_end)
-            if seg_end > seg_start:
-                py_by_label[label] += (seg_end - seg_start).days / 365.25
         if is_event.loc[pid]:
             ev_date = event.loc[pid]
             for label, p_start, p_end in periods:
@@ -1743,10 +1837,15 @@ def km_intervals(frame, downstream_outcome, group):
                                            exit_date[still_at_risk], is_event[still_at_risk])
         entry = entry[still_at_risk]
 
-    t_enter = (enter_date - entry).dt.days.values.astype(float)
-    t_exit = (exit_date - entry).dt.days.values.astype(float)
+    # one row per membership piece (counting-process form): a patient leaves the risk set
+    # during a membership gap and rejoins after it; the event sits on the last piece
+    rows, piece_start, piece_end, is_last = membership_pieces(enter_date, exit_date)
+    piece_entry = entry.reindex(rows).values
+    t_enter = ((piece_start.values - piece_entry) / np.timedelta64(1, "D")).astype(float)
+    t_exit = ((piece_end.values - piece_entry) / np.timedelta64(1, "D")).astype(float)
+    piece_event = is_event.reindex(rows).values & is_last
     keep = t_exit > t_enter
-    return t_enter[keep], t_exit[keep], is_event.values[keep]
+    return t_enter[keep], t_exit[keep], piece_event[keep]
 
 
 def risk_set_sizes(t_enter, t_exit, times):
@@ -2461,7 +2560,7 @@ def comorbidity_segments(frame, outcome, x):
             event &= (o - start).dt.days >= LAG_DAYS
         exit_ = end.where(~event, o)
         parts.append(pd.DataFrame({"state": state, "start": start,
-                                   "py": (exit_ - start).dt.days / 365.25, "event": event}))
+                                   "py": member_days(start, exit_) / 365.25, "event": event}))
     return pd.concat(parts, ignore_index=True)
 
 
@@ -2675,7 +2774,7 @@ def quarterly_person_years(frame, q_index, group_col="zone", groups=ZONE_ORDER):
     for q in q_index:
         seg_start = frame["fu_start"].clip(lower=q.start_time)
         seg_end   = frame["fu_end"].clip(upper=(q + 1).start_time)
-        py = (seg_end - seg_start).dt.days.clip(lower=0) / 365.25
+        py = member_days(seg_start, seg_end).clip(lower=0) / 365.25
         rows[q] = py.groupby(frame[group_col]).sum()
     return pd.DataFrame(rows).T.reindex(index=q_index, columns=groups).fillna(0)
 
@@ -3413,7 +3512,7 @@ def compute_relative_year_split(entry_dates, event_dates, max_years=10, full_yea
                 break   # stop here -- partial year not counted, nothing after it either
 
             bucket_end_capped = min(bucket_full_end, p_cap, e_end)
-            contributed_days = (bucket_end_capped - bucket_start).days
+            contributed_days = member_days_one(pid, bucket_start, bucket_end_capped)
             if contributed_days > 0:
                 py_by_year[k] = py_by_year.get(k, 0.0) + contributed_days / 365.25
                 if ev_date is not None and bucket_start < ev_date <= bucket_end_capped:
@@ -3587,7 +3686,7 @@ def _aggregate_intervals(start, end, is_event, event, cell, bounds, exposure_lab
         b_start, b_end = b_start.reindex(idx), b_end.reindex(idx)
         s = start.where(start > b_start, b_start)
         e = end.where(end < b_end, b_end)
-        py = (e - s).dt.days.clip(lower=0).fillna(0) / 365.25
+        py = member_days(s, e).clip(lower=0).fillna(0) / 365.25
         ev = (is_event & (event >= b_start) & (event < b_end)).astype(int)
         keep = (py > 0) | (ev > 0)
         if keep.any():
@@ -3911,7 +4010,7 @@ def era_person_time(cohort, frame, outcome):
     pre = cohort.loc[start.index, "era"] == "pre"
     is_event = is_event & ~(pre & (event >= OCT7))
     end = end.where(~(pre & (end > OCT7)), OCT7)
-    py = (end - start).dt.days.clip(lower=0) / 365.25
+    py = member_days(start, end).clip(lower=0) / 365.25
     return cohort.drop(columns=["entry"]).loc[start.index].assign(py=py, events=is_event.astype(int))
 
 
@@ -3957,7 +4056,7 @@ def group_person_time(cohort, frame, outcome, group):
     if LAG_DAYS > 0:
         is_event &= (event - members["entry"]).dt.days >= LAG_DAYS
     end = boundary.where(~is_event, event)
-    py = (end - OCT7).dt.days.clip(lower=0) / 365.25
+    py = member_days(pd.Series(OCT7, index=end.index), end).clip(lower=0) / 365.25
     return members.drop(columns=["entry"]).assign(py=py, events=is_event.astype(int))
 
 
@@ -4226,7 +4325,7 @@ def exposed_followup_detail(entry_dates, event_dates, window_days=None):
         [is_event, boundary == window_end, (boundary == fu_end) & (fu_end < STUDY_END)],
         FOLLOWUP_END_REASONS[:3], default=FOLLOWUP_END_REASONS[3])
     detail = pd.DataFrame({"entry": entry, "end": end, "event": is_event, "reason": reason,
-                           "months": (end - entry).dt.days / 30.44})
+                           "months": member_days(entry, end) / 30.44})   # months as a member
     return detail, int(prevalent.sum())
 
 
@@ -4910,6 +5009,21 @@ def _run_sanity_checks_body(frame_full, entry_meta_full, downstream_meta_full, o
     info("patients whose follow-up starts after 2017 (turned 15 after 1.1.2017)",
          f"{int((frame['fu_start'] > REGISTRY_START).sum()):,}")
 
+    # --- 1c. Membership gaps (left Clalit and came back) ---
+    gaps = _membership_gaps
+    info("patients with a membership gap (gap days are not person-time)",
+         f"{gaps.index.nunique():,}")
+    all_days = (frame["fu_end"] - frame["fu_start"]).dt.days.clip(lower=0)
+    kept_days = member_days(frame["fu_start"], frame["fu_end"]).clip(lower=0)
+    info("follow-up person-years removed as membership gaps",
+         f"{(all_days.sum() - kept_days.sum()) / 365.25:,.0f} of {all_days.sum() / 365.25:,.0f}")
+    check("member person-time never exceeds calendar follow-up", bool((kept_days <= all_days).all()))
+    if len(gaps):
+        dates = pd.concat({o: frame[f"first_{o}"] for o in ALL_OUTCOMES}, axis=1).reindex(gaps.index)
+        in_gap = dates.gt(gaps["gap_start"], axis=0) & dates.lt(gaps["gap_end"], axis=0)
+        info("first-ever diagnoses dated inside a membership gap (still counted as events)",
+             f"{int(in_gap.values.sum()):,}")
+
     # --- 2. zone_populations sums to len(frame), for every age band (exhaustive/mutually
     # exclusive zone assignment -- nobody should be silently dropped) ---
     for age_key, (age_label, lo, hi) in AGE_BANDS.items():
@@ -5141,7 +5255,7 @@ def export_all_diagnoser_modes(input_file, output_dir, trauma_mode=None):
 # PATHS -- adjust to the actual final matched-cohort file before running
 # =============================================================================
 
-INPUT_FILE = r"\\10.100.117.220\Projects$\R12-MHRC\Psychosis_Oct7_6Year_Amir\sagifolder\OutPutWorkingFiles\PsychosisPostWar\matched_cohort_PeriodOutComes4.csv"
+INPUT_FILE = r"\\10.100.117.220\Projects$\R12-MHRC\Psychosis_Oct7_6Year_Amir\sagifolder\OutPutWorkingFiles\PsychosisPostWar\matched_cohort_PeriodOutComes_Membership.csv"   # step B2 output
 OUTPUT_DIR = r"\\10.100.117.220\Projects$\R12-MHRC\Psychosis_Oct7_6Year_Amir\sagifolder\OutPutWorkingFiles\PDF_PostWarPsychosis\PresentationSummary"
 
 if __name__ == "__main__":
