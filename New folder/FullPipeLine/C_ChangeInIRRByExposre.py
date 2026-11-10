@@ -5004,7 +5004,7 @@ def _check_membership_gap_logic(frame, gaps, all_days, kept_days, check, sample_
 
     # (d) separate calculation on a sample: days inside [fu_start, fu_end] covered by
     # (before the first period) + each period + (after the last period)
-    rows = frame.index[several.values & has_gap][:sample_size]
+    rows = frame.index[several.values][:sample_size]   # chosen from the text, not from the parsed gaps
 
     def covered_days(text, start, end):
         periods = sorted(tuple(pd.to_datetime(p.split("-"), format="%d/%m/%Y")) for p in text.split(":"))
@@ -5014,7 +5014,7 @@ def _check_membership_gap_logic(frame, gaps, all_days, kept_days, check, sample_
     expected = pd.Series([covered_days(periods_text[r], frame.at[r, "fu_start"], frame.at[r, "fu_end"])
                           for r in rows], index=rows)
     differ = expected != kept_days[rows]
-    check(f"person-time matches a separate period-by-period calculation ({len(rows):,} patients with a gap)",
+    check(f"person-time matches a separate period-by-period calculation ({len(rows):,} patients with several periods)",
           not bool(differ.any()), f"{int(differ.sum()):,} differ")
 
     # (e) the KM pieces add up to the same member days
