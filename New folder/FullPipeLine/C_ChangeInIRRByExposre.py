@@ -1599,12 +1599,14 @@ def split_person_time_by_period(entry_dates, event_dates, window_days, periods):
     return events_by_label, py_by_label
 
 
-def compute_by_second_diagnosis_year(frame, downstream_outcome, side):
+def compute_by_second_diagnosis_year(frame, downstream_outcome, side, exposure_outcomes=None):
     """side: 'pre' or 'post' -- trauma diagnosed before/on-after Oct 7. Returns a DataFrame
     (label, n_events, person_years, irr) using the currently active window. 2023 is split
     exactly at Oct7 (SECOND_DIAGNOSIS_PERIODS), same as the entry-side Yearly trend chart --
-    not approximated by whole calendar year."""
-    first_trauma = first_of(frame, TRAUMA_EXPOSURE_OUTCOMES)
+    not approximated by whole calendar year. exposure_outcomes = the first diagnosis (default:
+    the active trauma exposure)."""
+    exposure_outcomes = TRAUMA_EXPOSURE_OUTCOMES if exposure_outcomes is None else exposure_outcomes
+    first_trauma = first_of(frame, exposure_outcomes)
     entry = first_trauma.where((first_trauma < OCT7) if side == "pre" else (first_trauma >= OCT7))
     down = frame[f"first_{downstream_outcome}"]
 
@@ -1614,7 +1616,7 @@ def compute_by_second_diagnosis_year(frame, downstream_outcome, side):
     # PER-PERIOD general reference via continuous Lexis tracking -- replaces the old single
     # anchor-averaged constant, so each period's IRR is measured against that SAME period's
     # general-population rate, not one rate repeated across every point on the chart.
-    gen_split = compute_general_lexis_split(frame, TRAUMA_EXPOSURE_OUTCOMES, downstream_outcome,
+    gen_split = compute_general_lexis_split(frame, exposure_outcomes, downstream_outcome,
                                             SECOND_DIAGNOSIS_PERIODS)
 
     rows = []
@@ -1682,10 +1684,10 @@ MIN_N_THRESHOLDS = [10, 30]
 # patient -- small-sample test (typically <10 points per group), not a patient-level
 # comparison. Treat p-values as suggestive, not definitive.
 def compute_second_diagnosis_boxplot_values(frame, downstream_outcome, trauma_side,
-                                            event_side="all", min_n=0):
+                                            event_side="all", min_n=0, exposure_outcomes=None):
     """trauma_side: 'pre' or 'post' (which line to pull from). event_side: 'pre' (period ends
     by Oct7), 'post' (period starts on/after Oct7), or 'all' (no restriction)."""
-    trend = compute_by_second_diagnosis_year(frame, downstream_outcome, trauma_side)
+    trend = compute_by_second_diagnosis_year(frame, downstream_outcome, trauma_side, exposure_outcomes)
     if event_side == "pre":
         trend = trend[trend["end"] <= OCT7]
     elif event_side == "post":
@@ -1694,15 +1696,18 @@ def compute_second_diagnosis_boxplot_values(frame, downstream_outcome, trauma_si
     return sub["irr"].dropna().values
 
 
-def draw_first_second_boxplot_combined(ax, frame, downstream_outcome, min_n=0):
-    gray_pre  = compute_second_diagnosis_boxplot_values(frame, downstream_outcome, "pre",  "pre",  min_n)
-    red_post  = compute_second_diagnosis_boxplot_values(frame, downstream_outcome, "post", "post", min_n)
-    gray3     = compute_second_diagnosis_boxplot_values(frame, downstream_outcome, "pre",  "post", min_n)
+def draw_first_second_boxplot_combined(ax, frame, downstream_outcome, min_n=0,
+                                       exposure_outcomes=None, first_label="trauma"):
+    """exposure_outcomes / first_label: the first diagnosis (default: the active trauma exposure)."""
+    values = [compute_second_diagnosis_boxplot_values(frame, downstream_outcome, side, event_side,
+                                                      min_n, exposure_outcomes)
+              for side, event_side in [("pre", "pre"), ("post", "post"), ("pre", "post")]]
+    gray_pre, red_post, gray3 = values
 
     bp = ax.boxplot([gray_pre, red_post, gray3], positions=[1, 2, 3], widths=0.5,
-                    labels=["trauma before Oct7\n(2nd dx: also before Oct7)",
-                          "trauma on/after Oct7\n(2nd dx: also on/after Oct7)",
-                          "trauma before Oct7\n(2nd dx: on/after Oct7)"],
+                    labels=[f"{first_label} before Oct7\n(2nd dx: also before Oct7)",
+                          f"{first_label} on/after Oct7\n(2nd dx: also on/after Oct7)",
+                          f"{first_label} before Oct7\n(2nd dx: on/after Oct7)"],
                     patch_artist=True, showmeans=True)
     for patch, color in zip(bp["boxes"], ["#95a5a6", "#e63946", "#95a5a6"]):
         patch.set_facecolor(color); patch.set_alpha(0.6)
@@ -2747,105 +2752,29 @@ def write_statement2(pdf, frame, age_label):
     plt.tight_layout()
     pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
 
-    write_three_group_page(pdf, frame, age_label)
+    write_entry_boxplot_pages(pdf, frame, age_label)
 
 
-# --- S2, STEP 6: Is group 3 more like group 1 or group 2? (page right after the % change heatmap)
-# Three groups per entry diagnosis X and second diagnosis Y (psychosis / bipolar), the same groups
-# as the era pages (X from 2017):
-#   group 1: X before Oct 7, followed until Oct 7       (both diagnoses before Oct 7)
-#   group 2: X on/after Oct 7                           (both diagnoses after Oct 7)
-#   group 3: X before Oct 7, Y-free on Oct 7, followed from Oct 7 to the same X + window end
-# Each group's RR = its rate / the general-population rate (as in the heatmaps above). The chart
-# shows group 1 and group 2 as % change compared with group 3: the shorter bar = the group that
-# group 3 is more like.
-THREE_GROUP_COLORS = {1: "#95a5a6", 2: "#e63946"}
-
-
-def three_group_rates(frame, exposure_outcomes, outcome):
-    """{group: (events, person_years)} for groups 1-3 -- see the comment above."""
-    entry_all = first_of(frame, exposure_outcomes)
-    entry_all = entry_all.where(entry_all >= REGISTRY_START)
-    down = frame[f"first_{outcome}"]
-    out = {}
-    start, end, is_event, event = exposed_intervals(entry_all.where(entry_all < OCT7), down)
-    end = end.where(end < OCT7, OCT7)
-    out[1] = (int((is_event & (event < OCT7)).sum()), member_days(start, end).clip(lower=0).sum() / 365.25)
-    start, end, is_event, _ = exposed_intervals(entry_all.where(entry_all >= OCT7), down)
-    out[2] = (int(is_event.sum()), member_days(start, end).clip(lower=0).sum() / 365.25)
-    pre = entry_all[entry_all < OCT7].dropna()
-    boundary = pd.concat([pre + pd.to_timedelta(FIXED_WINDOW_DAYS, unit="D"),
-                          pd.Series(STUDY_END, index=pre.index), followup_end_for(pre.index)], axis=1).min(axis=1)
-    y = down.reindex(pre.index)
-    at_risk = (boundary > OCT7) & ~(y.notna() & (y <= OCT7))
-    boundary, y = boundary[at_risk], y[at_risk]
-    is_event = y.notna() & (y <= boundary)
-    end = boundary.where(~is_event, y)
-    out[3] = (int(is_event.sum()),
-              member_days(pd.Series(OCT7, index=end.index), end).clip(lower=0).sum() / 365.25)
-    return out
-
-
-def compute_three_group_table(frame):
-    """One row per (entry diagnosis, focus outcome): events, person-years and RR of groups 1-3."""
-    rows = []
-    for label, exposure in current_alt_exposures().items():
-        for outcome in FOCUS_OUTCOMES:
-            if outcome in exposure:
+# --- S2, STEP 6: Year-IRR boxplots for every first diagnosis (pages right after the % change
+# heatmap). The same 3-box chart as Statement 1's trauma boxplot, with each of the 8 first
+# diagnoses in turn -- trauma first -- and psychosis / bipolar as the second diagnosis.
+def write_entry_boxplot_pages(pdf, frame, age_label):
+    for first_label, first_outcomes in current_alt_exposures().items():
+        fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+        fig.suptitle(f"STATEMENT 2 | First diagnosis: {first_label} -> second: psychosis / bipolar | "
+                     f"diagnosis-year IRR distribution (no minimum n) | {age_label}\n"
+                     f"Boxes 1 and 2 are t-tested (1st > 2nd); box 3 is NOT tested\n"
+                     f"CAUTION: each point = one YEAR's IRR, not one patient -- small-sample test",
+                     fontsize=10, fontweight="bold")
+        for ax, outcome in zip(axes, FOCUS_OUTCOMES):
+            if outcome in first_outcomes:
+                ax.axis("off")
+                ax.text(0.5, 0.5, f"{outcome.upper()}\n(same disorder as the first diagnosis)",
+                        ha="center", va="center", fontsize=11, transform=ax.transAxes)
                 continue
-            general_rate = compute_general_rate_overall(frame, exposure, outcome)[0]
-            row = {"exposure": label, "outcome": outcome}
-            for group, (events, py) in three_group_rates(frame, exposure, outcome).items():
-                rate = events / py * 1000 if py > 0 else np.nan
-                row[f"events{group}"] = events
-                row[f"rr{group}"] = rate / general_rate if general_rate else np.nan
-            rows.append(row)
-    return pd.DataFrame(rows)
-
-
-def draw_three_group_panel(ax, table, outcome, exposures):
-    sub = table[table["outcome"] == outcome].set_index("exposure").reindex(exposures)
-    y = np.arange(len(exposures))
-    h = 0.38
-    for group, offset in [(1, -h / 2), (2, h / 2)]:
-        change = (sub[f"rr{group}"] / sub["rr3"].replace(0, np.nan) - 1) * 100
-        ax.barh(y + offset, change.fillna(0), height=h, color=THREE_GROUP_COLORS[group],
-                label=f"Group {group} compared with group 3")
-        for yi, v in zip(y + offset, change):
-            if pd.notna(v):
-                ax.text(v + (2 if v >= 0 else -2), yi, f"{v:+.0f}%", va="center",
-                        ha="left" if v >= 0 else "right", fontsize=7.5)
-    labels = [f"{e}\n(events {int(r.events1)} / {int(r.events2)} / {int(r.events3)})" if pd.notna(r.events1)
-              else f"{e}\n(same disorder)" for e, r in sub.iterrows()]
-    ax.axvline(0, color="black", linewidth=1)
-    ax.set_yticks(y)
-    ax.set_yticklabels(labels, fontsize=8)
-    ax.set_xlabel("% difference in RR compared with group 3", fontsize=9)
-    ax.set_title(f"First diagnosis -> {outcome.upper()}", fontsize=10, fontweight="bold")
-
-
-def write_three_group_page(pdf, frame, age_label):
-    table = compute_three_group_table(frame)
-    exposures = list(current_alt_exposures())
-    fig, axes = plt.subplots(1, 2, figsize=(15, 7.5))   # own row labels: "same disorder" differs
-    fig.suptitle(f"STATEMENT 2 | Is group 3 more like group 1 or group 2? | within "
-                 f"{FIXED_WINDOW_DAYS // 30}mo | {age_label}\n"
-                 f"Group 1 = both diagnoses before Oct 7, group 2 = both after Oct 7, group 3 = first "
-                 f"before, second after Oct 7.\nThe SHORTER bar is the group that group 3 is more like.",
-                 fontsize=11, fontweight="bold")
-    for ax, outcome in zip(axes, FOCUS_OUTCOMES):
-        draw_three_group_panel(ax, table, outcome, exposures)
-    limit = max(60, np.nanmax(np.abs([ax.get_xlim() for ax in axes])))
-    for ax in axes:
-        ax.invert_yaxis()
-        ax.set_xlim(-limit, limit)
-    fig.legend(*axes[0].get_legend_handles_labels(), loc="lower center", ncol=2, fontsize=9,
-               bbox_to_anchor=(0.5, 0.035))
-    fig.text(0.5, 0.005, "events = group 1 / group 2 / group 3. RR = the group's rate / the general "
-             "population's rate. Group 1 is cut at Oct 7, so it differs a little from the slide before.",
-             fontsize=7.5, ha="center")
-    plt.tight_layout(rect=[0, 0.09, 1, 1])
-    pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+            draw_first_second_boxplot_combined(ax, frame, outcome, 0, first_outcomes, first_label)
+        plt.tight_layout()
+        pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
 
 
 # =============================================================================
