@@ -357,6 +357,7 @@ REGISTRY_START = pd.Timestamp("2017-01-01")   # earliest point with data -- star
 #     outcome and contributes no person-time for that outcome -- incl. an outcome before age 15.
 #   - STATEMENT 3: diagnoses and person-years both counted only from fu_start (age 15).
 MEMBERSHIP_END_COL   = "cohort reference event-membership end date"
+MARKETING_SECTOR_COL = "marketing sector"
 FOLLOWUP_MIN_AGE     = 15
 _followup_end = None   # per-patient fu_end Series (full-population index), set by set_followup()
 
@@ -689,6 +690,7 @@ BASE_COLS = ["patient id", "birth date", "gender",
              "mailing language", "demographics_2023-insurance type",
              "charlson - lastuntil2023-charlson score total",
              # --- follow-up (membership) window -- see FOLLOW-UP END below ---
+             MARKETING_SECTOR_COL,   # Sector in the adjusted models
              MEMBERSHIP_END_COL, MEMBERSHIP_PERIODS_COL]
 # Period-level columns needed for the Statement-1 supporting tests (2b uses the collapsed
 # "_start date" cols already in BASE; 5/9 need entry meta, 6 needs the downstream
@@ -719,6 +721,9 @@ NEEDED_COLS = (BASE_COLS + [f"{o}_start date" for o in ALL_OUTCOMES]
 def load_frame(input_file, chunksize=100_000):
     header = pd.read_csv(input_file, encoding="utf-8-sig", nrows=0)
     available = set(header.columns)
+    if MARKETING_SECTOR_COL not in available:
+        raise RuntimeError(f"'{MARKETING_SECTOR_COL}' (Sector in the adjusted models) is not in {input_file}. "
+                           f"Sector-like columns there: {[c for c in header.columns if 'sector' in c.lower()]}")
     usecols = [c for c in NEEDED_COLS if c in available]
     missing = [c for c in NEEDED_COLS if c not in available]
     if missing:
@@ -768,6 +773,7 @@ def build_frame(df):
     frame["ses_3level"]      = df.get("socioeconomic score three level scale", pd.Series(index=df.index)).values
     frame["distance_km"]     = pd.to_numeric(df.get("distance_to_gaza_km", pd.Series(index=df.index)), errors="coerce").values
     frame["sector"]          = df.get("demographics_2023-sector", pd.Series(index=df.index)).values
+    frame["marketing_sector"] = df.get(MARKETING_SECTOR_COL, pd.Series(index=df.index)).values
     frame["district"]        = df.get("demographics_2023-district", pd.Series(index=df.index)).values
     frame["country_of_birth"] = df.get("country of birth", pd.Series(index=df.index)).values
     frame["immigration_date"] = pd.to_datetime(
@@ -3726,8 +3732,9 @@ def load_and_build(input_file):
 # among patients who are otherwise similar on those factors.
 #   - Attained age: each stretch of person-time is split by the age the patient was at that time
 #     (5-year bands), so time spent at 22 counts as age 20-24 even if the patient is 40 at Oct 7.
-#   - Sex, sector, SES (5-level), Charlson (0/1/2/3+) are per-patient categories; a missing value
-#     is its own category. Each covariate's reference is its largest category (by person-years).
+#   - Sex, sector ("marketing sector" column), SES ("socioeconomic score three level scale"), Charlson
+#     (0/1/2/3+) are per-patient categories; a missing value is its own category. SES's reference is
+#     Medium (ADJ_REFERENCE); every other covariate's reference is its largest category (by person-years).
 #   - Region / zone is deliberately NOT in the model (on request); no calendar-year term either.
 #   - Fitted on AGGREGATED cells (exposure x age band x sex x sector x SES x Charlson: summed
 #     events and person-years) -- for a Poisson model this gives exactly the same estimates as
@@ -3740,7 +3747,28 @@ def load_and_build(input_file):
 #     their entry, so it may partly reflect consequences rather than only prior health.
 # =============================================================================
 ADJ_AGE_BANDS = [(a, a + 5, f"{a}-{a + 4}") for a in range(15, 65, 5)] + [(65, 200, "65+")]
-ADJ_COVARIATES = ["Sex", "Sector", "SES (5-level)", "Charlson"]
+ADJ_COVARIATES = ["Sex", "Sector", "SES (3-level)", "Charlson"]
+# Fixed reference level per covariate; any covariate not listed uses its largest category.
+ADJ_REFERENCE = {"SES (3-level)": "Medium"}
+_reported_missing_refs = set()
+
+
+def covariate_reference(table, col):
+    """Reference level of a covariate: ADJ_REFERENCE (matched ignoring case) if the data has it,
+    otherwise the largest category by person-years (with a one-time warning)."""
+    largest = table.groupby(col)["py"].sum().idxmax()
+    wanted = ADJ_REFERENCE.get(col)
+    if wanted is None:
+        return largest
+    levels = [str(l) for l in table[col].unique()]
+    matches = [l for l in levels if l.strip().lower() == wanted.lower()]
+    if matches:
+        return matches[0]
+    if col not in _reported_missing_refs:
+        _reported_missing_refs.add(col)
+        print(f"WARNING: reference '{wanted}' not found for {col} (levels: {sorted(levels)}) -- "
+              f"using the largest category '{largest}' instead")
+    return largest
 ADJ_COLORS = {"crude": "#95a5a6", "adjusted": "#e63946"}
 
 
@@ -3759,8 +3787,8 @@ def adjustment_covariates(frame):
     charlson = pd.cut(frame["charlson_score"], [-np.inf, 0, 1, 2, np.inf], labels=["0", "1", "2", "3+"])
     return pd.DataFrame({
         "Sex": _as_category(frame["gender"]),
-        "Sector": _as_category(frame["sector"]),
-        "SES (5-level)": _as_category(frame["ses_5level"]),
+        "Sector": _as_category(frame["marketing_sector"]),
+        "SES (3-level)": _as_category(frame["ses_3level"]),
         "Charlson": charlson.astype(object).where(charlson.notna(), "missing"),
     }, index=frame.index)
 
@@ -3830,13 +3858,13 @@ def build_poisson_table(frame, exposure_outcomes, downstream_outcome):
 
 def _poisson_design(table, exposure_col, covariates, exposure_ref):
     """Intercept + dummy columns: the exposure against `exposure_ref`, each covariate against its
-    largest category by person-years. Returns (columns, [(term, group, level)])."""
+    ADJ_REFERENCE level (else its largest category by person-years). Returns (columns, [(term, group, level)])."""
     cols, names = [np.ones(len(table))], [("Intercept", "", "")]
     for col in [exposure_col] + covariates:
         if col == exposure_col:
             ref = exposure_ref
         else:
-            ref = table.groupby(col)["py"].sum().idxmax()
+            ref = covariate_reference(table, col)
         for level in sorted(table[col].astype(str).unique()):
             if level == str(ref):
                 continue
@@ -3962,7 +3990,7 @@ def draw_forest(ax, rows, title, xlabel="IRR (log scale), 95% CI"):
 
 
 def write_adjusted_forest_pages(pdf, frame, age_label):
-    adj_note = (f"Adjusted for attained age (5-yr bands), sex, sector, SES (5-level), Charlson "
+    adj_note = (f"Adjusted for attained age (5-yr bands), sex, marketing sector, SES (3-level, ref Medium), Charlson "
                 f"(0/1/2/3+) -- Poisson regression, offset log(person-years), 95% Wald CI. "
                 f"Same person-time as the crude IRR: within {FIXED_WINDOW_DAYS // 30}mo of entry, "
                 f"membership end, age 15+, prevalent cases excluded.")
@@ -4005,7 +4033,7 @@ def write_adjusted_forest_pages(pdf, frame, age_label):
             if group == "exposure":
                 ref = "general"
             else:
-                ref = table.groupby(group)["py"].sum().idxmax()
+                ref = covariate_reference(table, group)
             rows.append((f"{'Exposure' if group == 'exposure' else 'Attained age' if group == 'age' else group}"
                          f"  (ref: {rtl(ref)})", None, None, None, None))
             for r in g.itertuples():
@@ -4172,7 +4200,7 @@ def _era_fit(cells, covariates, subgroup=None, cmp="post", ref="pre"):
     post = (cells["era"] == cmp).values.astype(float)
     levels = [None]
     if subgroup:
-        sg_ref = str(cells.groupby(subgroup)["py"].sum().idxmax())
+        sg_ref = str(covariate_reference(cells, subgroup))
         levels = [sg_ref] + [l for l in sorted(cells[subgroup].astype(str).unique()) if l != sg_ref]
         cols += [post * (cells[subgroup].astype(str) == l).values for l in levels[1:]]
     X = np.column_stack(cols)
@@ -4284,8 +4312,8 @@ def write_era_comparison(pdf, frame, cohort, age_label, cmp="post", ref="pre"):
     if "crossing" in (cmp, ref):
         design_note += (f"\nCrossing group: {x_label} before Oct 7 and no Y by 7.10.2023; person-time from "
                         f"7.10.2023 to the earliest of Y, {cap} after {x_label}, leaving Clalit, 30.6.2026.")
-    adj_note = ("Adjusted: age at X (" + "/".join(l for _, _, l in ERA_AGE_BANDS) + "), sex, sector, "
-                "SES (5-level), Charlson (0/1/2/3+). Poisson, offset log(person-years), 95% Wald CI.")
+    adj_note = ("Adjusted: age at X (" + "/".join(l for _, _, l in ERA_AGE_BANDS) + "), sex, marketing sector, "
+                "SES (3-level, ref Medium), Charlson (0/1/2/3+). Poisson, offset log(person-years), 95% Wald CI.")
     vs = f"{cmp} vs {ref}"
     groups = pd.concat([group_cohort(cohort, ref), group_cohort(cohort, cmp)])
     n_ref, n_cmp = int((groups["era"] == ref).sum()), int((groups["era"] == cmp).sum())
@@ -4516,8 +4544,10 @@ def desc_population_table_page(pdf, frame, age_label):
         levels = [l for l in levels if l != "missing"] + (["missing"] if "missing" in levels else [])
         if var == "Age at Oct 7":
             levels = [l for _, _, l in DESC_AGE_BANDS if l in levels] + [l for l in levels if l == "missing"]
-        elif var in ("SES (5-level)", "Charlson"):   # ordinal -- in order, not by size
-            levels = sorted(l for l in levels if l != "missing") + [l for l in levels if l == "missing"]
+        elif var in ("SES (3-level)", "Charlson"):   # ordinal -- in order, not by size
+            order = {"low": 0, "medium": 1, "high": 2}
+            levels = (sorted((l for l in levels if l != "missing"), key=lambda l: (order.get(l.strip().lower(), 9), l))
+                      + [l for l in levels if l == "missing"])
         for level in levels:
             rows[(var, level)] = {g: (f"{int((covs.loc[m, var] == level).sum()):,} "
                                       f"({(covs.loc[m, var] == level).mean() * 100:.1f}%)" if m.any() else "-")
