@@ -3715,6 +3715,8 @@ def load_and_build(input_file):
     print(f"Loaded {len(df):,} rows.")
     built = build_frame(df)
     set_followup(built[0])
+    global _FULL_COHORT_N
+    _FULL_COHORT_N = len(built[0])
     return built
 
 
@@ -4782,6 +4784,86 @@ def desc_second_dx_year_page(pdf, frame, age_label):
                          "box 3 = 'trauma pre' periods from Oct 7.")
 
 
+_FULL_COHORT_N = None   # patients in the input file, set by load_and_build()
+
+
+def second_dx_flow(frame, outcome):
+    """Who is left after each rule of the 'By year of SECOND diagnosis' graph. Returns a list of
+    (step, {"pre": n, "post": n}); the last count equals the sum of the n= labels on the graph."""
+    tr = TRAUMA_EXPOSURE_LABEL
+    raw = first_of_raw(frame, TRAUMA_EXPOSURE_OUTCOMES)
+    entry_all = first_of(frame, TRAUMA_EXPOSURE_OUTCOMES)
+    both = lambda n: {"pre": n, "post": n}
+    steps = []
+    if _FULL_COHORT_N is not None:
+        steps.append(("Patients in the input file", both(_FULL_COHORT_N)))
+    steps.append(("In this age band (and population)", both(len(frame))))
+    steps.append((f"Ever diagnosed with {tr}", both(int(raw.notna().sum()))))
+    steps.append((f"First {tr} at age 15 or older", both(int(raw.where(~(raw < frame['age15_date'])).notna().sum()))))
+    if CURRENT_DIAGNOSER_MODE != "any_diagnoser":
+        steps.append((f"First {tr} given by: {CURRENT_DIAGNOSER_LABEL}", both(int(entry_all.notna().sum()))))
+    rules = {"pre": [], "post": []}
+    window = pd.to_timedelta(FIXED_WINDOW_DAYS, unit="D")
+    for side in ("pre", "post"):
+        entry = entry_all[(entry_all < OCT7) if side == "pre" else (entry_all >= OCT7)]
+        down = frame[f"first_{outcome}"].reindex(entry.index)
+        fu_end = followup_end_for(entry.index)
+        keep = pd.Series(True, index=entry.index)
+        rules[side].append(keep.sum())
+        keep &= ~(down.notna() & (down <= entry))
+        rules[side].append(keep.sum())
+        keep &= down.notna() & (down > entry)
+        rules[side].append(keep.sum())
+        keep &= down <= entry + window
+        rules[side].append(keep.sum())
+        keep &= down <= STUDY_END
+        rules[side].append(keep.sum())
+        keep &= down <= fu_end
+        rules[side].append(keep.sum())
+        keep &= (down >= SECOND_DIAGNOSIS_PERIODS[0][1]) & (down < SECOND_DIAGNOSIS_PERIODS[-1][2])
+        rules[side].append(keep.sum())
+    names = [f"First {tr} before Oct 7 (pre) / on or after Oct 7 (post)",
+             f"No second diagnosis (column) on or before the {tr} date (not a prior case)",
+             f"Got the second diagnosis after the {tr} date (any time)",
+             f"... within {FIXED_WINDOW_DAYS // 30} months of the {tr} date",
+             f"... by the study end ({STUDY_END:%d.%m.%Y})",
+             f"... before leaving Clalit (membership end)",
+             f"... in {SECOND_DIAGNOSIS_YEAR_RANGE[0]}-{SECOND_DIAGNOSIS_YEAR_RANGE[-1]} (the graph's years)"]
+    for i, name in enumerate(names):
+        steps.append((name, {side: int(rules[side][i]) for side in ("pre", "post")}))
+    return steps
+
+
+def desc_second_dx_flow_page(pdf, frame, age_label):
+    """Patient flow behind the 'By year of SECOND diagnosis' graph: how many are left after each
+    rule, and how much each rule removed."""
+    entry = first_of(frame, TRAUMA_EXPOSURE_OUTCOMES)
+    columns, checks = {}, []
+    for o in FOCUS_OUTCOMES:
+        steps = second_dx_flow(frame, o)
+        for side, side_name in [("pre", "before Oct 7"), ("post", "on/after Oct 7")]:
+            col, previous = {}, None
+            for name, counts in steps:
+                n = counts[side]
+                change = "" if previous is None or previous == 0 else f" ({(n - previous) / previous * 100:+.0f}%)"
+                col[name] = f"{n:,}{change}"
+                previous = n
+            on_graph = sum(split_person_time_by_period(
+                entry.where((entry < OCT7) if side == "pre" else (entry >= OCT7)), frame[f"first_{o}"],
+                FIXED_WINDOW_DAYS, SECOND_DIAGNOSIS_PERIODS)[0].values())
+            mismatch = "" if on_graph == previous else "  MISMATCH"
+            col["Sum of the n= labels on the graph (check)"] = f"{on_graph:,}{mismatch}"
+            checks.append(on_graph == previous)
+            columns[f"{o.upper()}\n{TRAUMA_EXPOSURE_LABEL} {side_name}"] = col
+    df = pd.DataFrame(columns); df.index.name = "Step (each row keeps only who passed it)"
+    draw_table_page(pdf, f"DESCRIPTIVE | Slides 10-15 | patient flow behind 'By year of SECOND diagnosis' | "
+                         f"{age_label}", df, font_size=7,
+                    note="Each number = patients still in after that step; in brackets = change from the row "
+                         "above. The last step is the number of second diagnoses on the graph (its n= labels "
+                         "added up). " + ("Check OK: the flow and the graph agree." if all(checks)
+                                          else "CHECK FAILED: the flow and the graph do not agree."))
+
+
 def desc_patient_level_page(pdf, frame, age_label):
     rows = {}
     box_names = {1: "box 1: trauma & 2nd dx before Oct 7", 2: "box 2: both on/after Oct 7",
@@ -4920,6 +5002,7 @@ def write_descriptive_pdf(output_pdf, frame, entry_meta, outcome_profession_meta
         desc_old_method_tests_page(pdf, frame, entry_meta, age_label)
         desc_yearly_pages(pdf, frame, age_label)
         desc_second_dx_year_page(pdf, frame, age_label)
+        desc_second_dx_flow_page(pdf, frame, age_label)
         desc_patient_level_page(pdf, frame, age_label)
         desc_statement2_page(pdf, frame, age_label)
         desc_statement3_pages(pdf, frame, age_label)
