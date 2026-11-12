@@ -2752,29 +2752,30 @@ def write_statement2(pdf, frame, age_label):
     plt.tight_layout()
     pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
 
-    write_entry_boxplot_pages(pdf, frame, age_label)
+    write_trauma_all_second_boxplot_pages(pdf, frame, age_label)
 
 
-# --- S2, STEP 6: Year-IRR boxplots for every first diagnosis (pages right after the % change
-# heatmap). The same 3-box chart as Statement 1's trauma boxplot, with each of the 8 first
-# diagnoses in turn -- trauma first -- and psychosis / bipolar as the second diagnosis.
-def write_entry_boxplot_pages(pdf, frame, age_label):
-    for first_label, first_outcomes in current_alt_exposures().items():
-        fig, axes = plt.subplots(1, 2, figsize=(14, 7))
-        fig.suptitle(f"STATEMENT 2 | First diagnosis: {first_label} -> second: psychosis / bipolar | "
-                     f"diagnosis-year IRR distribution (no minimum n) | {age_label}\n"
-                     f"Boxes 1 and 2 are t-tested (1st > 2nd); box 3 is NOT tested\n"
-                     f"CAUTION: each point = one YEAR's IRR, not one patient -- small-sample test",
-                     fontsize=10, fontweight="bold")
-        for ax, outcome in zip(axes, FOCUS_OUTCOMES):
-            if outcome in first_outcomes:
+# --- S2, STEP 6: Year-IRR boxplots, trauma -> EVERY second diagnosis (pages right after the %
+# change heatmap). The same 3-box chart as Statement 1's trauma boxplot (which covers psychosis
+# and bipolar only), for all 7 non-trauma diagnoses, 2 per page, in every minimum-n version.
+def write_trauma_all_second_boxplot_pages(pdf, frame, age_label):
+    seconds = S1_DOWNSTREAM   # psychosis, bipolar, anxiety, depression, substance, personality, OCD
+    for min_n in [0] + MIN_N_THRESHOLDS:
+        n_note = f"only years with n>={min_n}" if min_n > 0 else "no minimum n"
+        for i in range(0, len(seconds), 2):
+            fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+            fig.suptitle(f"STATEMENT 2 | First diagnosis: {TRAUMA_EXPOSURE_LABEL} -> second: every other "
+                         f"diagnosis | diagnosis-year IRR distribution ({n_note}) | {age_label}\n"
+                         f"Boxes 1 and 2 are t-tested (1st > 2nd); box 3 is NOT tested\n"
+                         f"CAUTION: each point = one YEAR's IRR, not one patient -- small-sample test",
+                         fontsize=10, fontweight="bold")
+            page = seconds[i:i + 2]
+            for ax, outcome in zip(axes, page):
+                draw_first_second_boxplot_combined(ax, frame, outcome, min_n)
+            for ax in axes[len(page):]:
                 ax.axis("off")
-                ax.text(0.5, 0.5, f"{outcome.upper()}\n(same disorder as the first diagnosis)",
-                        ha="center", va="center", fontsize=11, transform=ax.transAxes)
-                continue
-            draw_first_second_boxplot_combined(ax, frame, outcome, 0, first_outcomes, first_label)
-        plt.tight_layout()
-        pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+            plt.tight_layout()
+            pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
 
 
 # =============================================================================
