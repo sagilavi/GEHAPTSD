@@ -4,9 +4,18 @@
 !.gitignore
 !presentation_summary_step6.py
 !inspect_followup_columns.py
-!New folder/
-!New folder/FullPipeLine/C_ChangeInIRRByExposre.py
-!New folder/FullPipeLine/
-!New folder/FullPipeLine/A_CombineRawDataTables.py
-!New folder/FullPipeLine/B_first_ever_geo_two_tables.py
-!New folder/FullPipeLine/B2_AddMembershipPeriods.py
+!Scripts/
+!Scripts/FullPipeLine/
+!Scripts/FullPipeLine/A_CombineRawDataTables.py
+!Scripts/FullPipeLine/B_first_ever_geo_two_tables.py
+!Scripts/FullPipeLine/B2_AddMembershipPeriods.py
+# step C is split into 9 files -- run C_ChangeInIRRByExposre.py (all in the same directory)
+!Scripts/FullPipeLine/C_ChangeInIRRByExposre.py
+!Scripts/FullPipeLine/C_IRR_Core.py
+!Scripts/FullPipeLine/C_IRR_Analyses.py
+!Scripts/FullPipeLine/C_IRR_Models.py
+!Scripts/FullPipeLine/C_IRR_Checks.py
+!Scripts/FullPipeLine/C_IRR_Tables.py
+!Scripts/FullPipeLine/C_IRR_Graphs_Statement1.py
+!Scripts/FullPipeLine/C_IRR_Graphs_Statements2to6.py
+!Scripts/FullPipeLine/C_IRR_Graphs_Demog_Models.py
