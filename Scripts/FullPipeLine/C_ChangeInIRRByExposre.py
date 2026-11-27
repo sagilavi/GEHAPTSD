@@ -1,8 +1,7 @@
 # C_ChangeInIRRByExposre.py -- MAIN: run this file. The pipeline is split into 9 files that must
 # sit in the same directory:
-#   C_IRR_Core.py                  -- run settings (SLIM_RUN, SELECTED_TRAUMA_MODE, ...), run-time
-#                                     state, loading, membership / follow-up / person-time core,
-#                                     population variants
+#   C_IRR_Core.py                  -- run-time state, loading, membership / follow-up /
+#                                     person-time core, population variants
 #   C_IRR_Analyses.py              -- the computations behind Statements 1-7 and the descriptive PDF
 #   C_IRR_Models.py                -- adjusted IRR (Poisson) and the era comparisons
 #   C_IRR_Checks.py                -- automated sanity checks
@@ -11,12 +10,58 @@
 #   C_IRR_Graphs_Statements2to6.py -- graphs: Statements 2, 3, 5, 6 and comorbidity
 #   C_IRR_Graphs_Demog_Models.py   -- graphs: demographic / relative-year PDFs, adjusted IRR
 #                                     forests, era comparisons, section dividers, descriptive charts
-#   C_ChangeInIRRByExposre.py      -- MAIN: PDF assembly (export_all*), INPUT_FILE / OUTPUT_DIR,
-#                                     __main__
+#   C_ChangeInIRRByExposre.py      -- MAIN: USER SETTINGS (everything you edit), PDF assembly
+#                                     (export_all*), __main__
 # The description below is the original one for the whole pipeline.
 # Run-time state (active window / trauma / diagnoser mode, follow-up end) lives in C_IRR_Core and
 # is always read as core.NAME outside it (the two print-once diagnostic flags: analyses.NAME),
 # so every module sees the current value.
+
+# #############################################################################
+# USER SETTINGS -- everything you normally change is here; no need to open the other files.
+# #############################################################################
+
+# --- Paths ---------------------------------------------------------------------------------
+INPUT_FILE = r"\\10.100.117.220\Projects$\R12-MHRC\Psychosis_Oct7_6Year_Amir\sagifolder\OutPutWorkingFiles\PsychosisPostWar\matched_cohort_PeriodOutComes_Membership.csv"   # step B2 output
+OUTPUT_DIR = r"\\10.100.117.220\Projects$\R12-MHRC\Psychosis_Oct7_6Year_Amir\sagifolder\OutPutWorkingFiles\PDF_PostWarPsychosis\PresentationSummary"
+
+# --- Which trauma mode to run (edit this, then re-run) -------------------------------------
+# One of: "ptsd_asr" (PTSD/ASR merged), "ptsd_only", "asr_only".
+# Unlike trauma mode (which auto-loops all 3 in export_all_trauma_modes()), diagnoser mode
+# ALWAYS loops all 3 automatically for whichever single trauma mode is selected here -- so one
+# full run produces 2 age bands x 3 diagnoser modes x 2 windows = 12 files for this trauma mode.
+# Change this and re-run to get another trauma mode's files instead of generating all at once.
+SELECTED_TRAUMA_MODE = "ptsd_asr"
+
+# --- SLIM_RUN: True -> write ONLY presentation_summary_<SLIM_AGE_BAND>_<trauma>_<SLIM_WINDOW>_
+# <SLIM_DIAGNOSER>.pdf (+ the EXTRA_POPULATIONS files below); no demographic / relative-year PDFs;
+# sanity checks still print to the console but no report file. False -> the full 12-file run.
+SLIM_RUN = True
+SLIM_AGE_BAND  = "age15_40"        # "age15_40" or "age15_plus"
+SLIM_WINDOW    = "24mo"            # "12mo" or "24mo"
+SLIM_DIAGNOSER = "any_diagnoser"   # "any_diagnoser", "psychiatrist_only" or "non_psychiatrist_only"
+
+# --- Geographic sub-population files, made for the SLIM combination above (age band / window /
+# diagnoser), in both SLIM and full runs. Options (defined in POPULATIONS in C_IRR_Core.py):
+#   "gaza20km"          <= 20 km from Gaza
+#   "over20km_nonorth"  > 20 km from Gaza, no Northern Border
+#   "no7km_nonorth"     no 0-7 km from Gaza, no Northern Border (missing distance kept)
+# Use [] for none.
+EXTRA_POPULATIONS = ["gaza20km", "over20km_nonorth", "no7km_nonorth"]
+
+# --- LAG_DAYS: protopathic-bias exclusion window, OFF by default (0) -----------------------
+# If > 0, a downstream diagnosis occurring within LAG_DAYS of the entry diagnosis is NOT
+# counted as a "hit" -- the concern is that a diagnosis given days-to-weeks after entry may
+# reflect the SAME clinical episode being relabeled (e.g. an ASR diagnosis given in the chaos
+# right after Oct 7 that gets corrected to a psychosis diagnosis three weeks later isn't really
+# "trauma causing psychosis in 3 weeks" -- it's one episode, two labels), not a genuine delayed
+# effect. Left at 0 (no exclusion) until the latency histograms (Statement 6) show whether
+# there's actually a suspicious early spike that would justify a specific value.
+LAG_DAYS = 0
+
+# #############################################################################
+# END OF USER SETTINGS
+# #############################################################################
 
 import os
 import io
@@ -32,8 +77,7 @@ warnings.filterwarnings("ignore")
 
 import C_IRR_Core as core   # run-time state -- read as core.NAME
 from C_IRR_Core import (  # noqa: F401
-    AGE_BANDS, DIAGNOSER_MODES, EXTRA_POPULATIONS, POPULATIONS, SELECTED_TRAUMA_MODE,
-    SLIM_AGE_BAND, SLIM_DIAGNOSER, SLIM_RUN, SLIM_WINDOW, TRAUMA_MODES, WINDOW_MODES, apply_age,
+    AGE_BANDS, DIAGNOSER_MODES, POPULATIONS, TRAUMA_MODES, WINDOW_MODES, apply_age,
     apply_population, load_and_build, set_diagnoser_mode, set_trauma_mode, set_window_mode,
 )
 from C_IRR_Models import (  # noqa: F401
@@ -59,6 +103,35 @@ from C_IRR_Graphs_Demog_Models import (  # noqa: F401
     write_adjusted_forest_pages, write_demographic_comparison_pdf, write_demographic_insights_pdf,
     write_era_pages, write_relative_year_pdf,
 )
+
+
+# --- Hand the USER SETTINGS that the other modules need to C_IRR_Core (read there as core.NAME),
+# and stop early with a clear message if a setting is misspelled.
+def apply_user_settings():
+    problems = []
+    if SELECTED_TRAUMA_MODE not in TRAUMA_MODES:
+        problems.append(f"SELECTED_TRAUMA_MODE={SELECTED_TRAUMA_MODE!r} -- options: {list(TRAUMA_MODES)}")
+    if SLIM_AGE_BAND not in AGE_BANDS:
+        problems.append(f"SLIM_AGE_BAND={SLIM_AGE_BAND!r} -- options: {list(AGE_BANDS)}")
+    if SLIM_WINDOW not in WINDOW_MODES:
+        problems.append(f"SLIM_WINDOW={SLIM_WINDOW!r} -- options: {list(WINDOW_MODES)}")
+    if SLIM_DIAGNOSER not in DIAGNOSER_MODES:
+        problems.append(f"SLIM_DIAGNOSER={SLIM_DIAGNOSER!r} -- options: {list(DIAGNOSER_MODES)}")
+    for population_key in EXTRA_POPULATIONS:
+        if population_key not in POPULATIONS or population_key == "all":
+            problems.append(f"EXTRA_POPULATIONS has {population_key!r} -- options: "
+                            f"{[k for k in POPULATIONS if k != 'all']}")
+    if not isinstance(SLIM_RUN, bool):
+        problems.append(f"SLIM_RUN={SLIM_RUN!r} -- must be True or False")
+    if not isinstance(LAG_DAYS, int) or isinstance(LAG_DAYS, bool) or LAG_DAYS < 0:
+        problems.append(f"LAG_DAYS={LAG_DAYS!r} -- must be a whole number of days >= 0")
+    if problems:
+        raise ValueError("USER SETTINGS problem(s) in C_ChangeInIRRByExposre.py:\n  " + "\n  ".join(problems))
+    core.SELECTED_TRAUMA_MODE = SELECTED_TRAUMA_MODE
+    core.LAG_DAYS = LAG_DAYS
+
+
+apply_user_settings()
 
 # =============================================================================
 # presentation_summary_step6.py
@@ -87,7 +160,7 @@ from C_IRR_Graphs_Demog_Models import (  # noqa: F401
 # restricted to psychiatrist-diagnosed trauma only, that's evidence the gap
 # is (at least partly) about WHO is diagnosing, not just WHEN. The __main__
 # block runs this axis fully (3 diagnoser modes x 2 age bands = 6 files) for
-# ONE trauma mode at a time (SELECTED_TRAUMA_MODE below) -- change that
+# ONE trauma mode at a time (SELECTED_TRAUMA_MODE in USER SETTINGS) -- change that
 # constant and re-run to get another trauma mode's 6 files, rather than
 # generating all 3 trauma x 3 diagnoser x 2 age = 18 files in a single run.
 #
@@ -437,16 +510,10 @@ def export_all_diagnoser_modes(input_file, output_dir, trauma_mode=None):
     set_window_mode("12mo")
 
 
-# =============================================================================
-# PATHS -- adjust to the actual final matched-cohort file before running
-# =============================================================================
-
-INPUT_FILE = r"\\10.100.117.220\Projects$\R12-MHRC\Psychosis_Oct7_6Year_Amir\sagifolder\OutPutWorkingFiles\PsychosisPostWar\matched_cohort_PeriodOutComes_Membership.csv"   # step B2 output
-OUTPUT_DIR = r"\\10.100.117.220\Projects$\R12-MHRC\Psychosis_Oct7_6Year_Amir\sagifolder\OutPutWorkingFiles\PDF_PostWarPsychosis\PresentationSummary"
-
+# INPUT_FILE / OUTPUT_DIR: see USER SETTINGS at the top of this file.
 if __name__ == "__main__":
-    # SLIM_RUN=True (default): 1 file only -- see SLIM_RUN above. SLIM_RUN=False: 12 files,
-    # 2 age bands x 3 diagnoser modes x 2 window modes, for SELECTED_TRAUMA_MODE above.
+    # SLIM_RUN=True (default): 1 file + the EXTRA_POPULATIONS files. SLIM_RUN=False: 12 files,
+    # 2 age bands x 3 diagnoser modes x 2 window modes, for SELECTED_TRAUMA_MODE (USER SETTINGS).
     # To run all 3 trauma modes without diagnoser/window variation instead (the older,
     # simpler 6-file workflow from before these features), call
     # export_all_trauma_modes(INPUT_FILE, OUTPUT_DIR) instead.

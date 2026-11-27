@@ -2,9 +2,8 @@
 # relative-year PDFs, adjusted IRR forest plots, era comparison love / forest pages, gray
 # section dividers, and the descriptive companion pages that include charts.
 # Part of the pipeline run by C_ChangeInIRRByExposre.py (all files in the same directory):
-#   C_IRR_Core.py                  -- run settings (SLIM_RUN, SELECTED_TRAUMA_MODE, ...), run-time
-#                                     state, loading, membership / follow-up / person-time core,
-#                                     population variants
+#   C_IRR_Core.py                  -- run-time state, loading, membership / follow-up /
+#                                     person-time core, population variants
 #   C_IRR_Analyses.py              -- the computations behind Statements 1-7 and the descriptive PDF
 #   C_IRR_Models.py                -- adjusted IRR (Poisson) and the era comparisons
 #   C_IRR_Checks.py                -- automated sanity checks
@@ -13,8 +12,8 @@
 #   C_IRR_Graphs_Statements2to6.py -- graphs: Statements 2, 3, 5, 6 and comorbidity
 #   C_IRR_Graphs_Demog_Models.py   -- graphs: demographic / relative-year PDFs, adjusted IRR
 #                                     forests, era comparisons, section dividers, descriptive charts
-#   C_ChangeInIRRByExposre.py      -- MAIN: PDF assembly (export_all*), INPUT_FILE / OUTPUT_DIR,
-#                                     __main__
+#   C_ChangeInIRRByExposre.py      -- MAIN: USER SETTINGS (everything you edit), PDF assembly
+#                                     (export_all*), __main__
 # Run-time state (active window / trauma / diagnoser mode, follow-up end) lives in C_IRR_Core and
 # is always read as core.NAME outside it (the two print-once diagnostic flags: analyses.NAME),
 # so every module sees the current value.
@@ -34,7 +33,7 @@ warnings.filterwarnings("ignore")
 import C_IRR_Core as core   # run-time state -- read as core.NAME
 from C_IRR_Core import (  # noqa: F401
     FOCUS_OUTCOMES, MISSING_PROFESSION_CODES, OCT7, REGISTRY_START, S1_DOWNSTREAM,
-    SELECTED_TRAUMA_MODE, STUDY_END, ZONE_LABELS, ZONE_ORDER, compute_general_rate_overall,
+    STUDY_END, ZONE_LABELS, ZONE_ORDER, compute_general_rate_overall,
     current_alt_exposures, first_of, get_exposure_meta_field, normalize_profession_code,
     profession_code_label, set_trauma_mode,
 )
@@ -251,7 +250,7 @@ def draw_days_since_oct7_panel(ax, post):
 
 # --- S7, STEP 3: Write the whole demographic-comparison PDF (its own file, not per-mode) ---
 def write_demographic_comparison_pdf(frame_full, entry_meta_full, output_dir, trauma_mode=None):
-    trauma_mode = trauma_mode or SELECTED_TRAUMA_MODE
+    trauma_mode = trauma_mode or core.SELECTED_TRAUMA_MODE
     set_trauma_mode(trauma_mode)
     pre, post = split_trauma_pre_post(frame_full)
     print(f"\n=== Demographic comparison | trauma={core.TRAUMA_EXPOSURE_LABEL} | "
@@ -324,7 +323,7 @@ def write_demographic_comparison_pdf(frame_full, entry_meta_full, output_dir, tr
 # =============================================================================
 
 def write_demographic_insights_pdf(frame_full, entry_meta_full, output_dir, trauma_mode=None):
-    trauma_mode = trauma_mode or SELECTED_TRAUMA_MODE
+    trauma_mode = trauma_mode or core.SELECTED_TRAUMA_MODE
     set_trauma_mode(trauma_mode)
     pre, post = split_trauma_pre_post(frame_full)
     print(f"\n=== Demographic insights (descriptive only) | trauma={core.TRAUMA_EXPOSURE_LABEL} | "
@@ -403,7 +402,7 @@ def draw_relative_year_panel(ax, frame, downstream_outcome, title, full_years_on
 
 
 def write_relative_year_pdf(frame_full, output_dir, trauma_mode=None):
-    trauma_mode = trauma_mode or SELECTED_TRAUMA_MODE
+    trauma_mode = trauma_mode or core.SELECTED_TRAUMA_MODE
     set_trauma_mode(trauma_mode)
     print(f"\n=== IRR by year since trauma diagnosis | trauma={core.TRAUMA_EXPOSURE_LABEL} ===")
 

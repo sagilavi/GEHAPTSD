@@ -2,9 +2,8 @@
 # Kaplan-Meier, comorbidity, zones, latency, demographics, relative year) and the helpers
 # behind the descriptive companion PDF.
 # Part of the pipeline run by C_ChangeInIRRByExposre.py (all files in the same directory):
-#   C_IRR_Core.py                  -- run settings (SLIM_RUN, SELECTED_TRAUMA_MODE, ...), run-time
-#                                     state, loading, membership / follow-up / person-time core,
-#                                     population variants
+#   C_IRR_Core.py                  -- run-time state, loading, membership / follow-up /
+#                                     person-time core, population variants
 #   C_IRR_Analyses.py              -- the computations behind Statements 1-7 and the descriptive PDF
 #   C_IRR_Models.py                -- adjusted IRR (Poisson) and the era comparisons
 #   C_IRR_Checks.py                -- automated sanity checks
@@ -13,8 +12,8 @@
 #   C_IRR_Graphs_Statements2to6.py -- graphs: Statements 2, 3, 5, 6 and comorbidity
 #   C_IRR_Graphs_Demog_Models.py   -- graphs: demographic / relative-year PDFs, adjusted IRR
 #                                     forests, era comparisons, section dividers, descriptive charts
-#   C_ChangeInIRRByExposre.py      -- MAIN: PDF assembly (export_all*), INPUT_FILE / OUTPUT_DIR,
-#                                     __main__
+#   C_ChangeInIRRByExposre.py      -- MAIN: USER SETTINGS (everything you edit), PDF assembly
+#                                     (export_all*), __main__
 # Run-time state (active window / trauma / diagnoser mode, follow-up end) lives in C_IRR_Core and
 # is always read as core.NAME outside it (the two print-once diagnostic flags: analyses.NAME),
 # so every module sees the current value.
@@ -33,7 +32,7 @@ warnings.filterwarnings("ignore")
 
 import C_IRR_Core as core   # run-time state -- read as core.NAME
 from C_IRR_Core import (  # noqa: F401
-    ALL_OUTCOMES, FOCUS_OUTCOMES, LAG_DAYS, MISSING_PROFESSION_CODES, OCT7,
+    ALL_OUTCOMES, FOCUS_OUTCOMES, MISSING_PROFESSION_CODES, OCT7,
     PSYCHIATRIST_PROFESSION_CODES, PSYCHOSIS_SPECTRUM_CODES, PSYCHOSIS_TRANSIENT_CODE, STUDY_END,
     ZONE_ORDER, compute_general_lexis_split, compute_general_rate_overall, current_alt_exposures,
     first_of, first_of_raw, followup_end_for, get_exposure_meta_field, member_days,
@@ -555,8 +554,8 @@ def compute_time_to_second_dx(frame, downstream_outcome, trauma_side, event_side
     boundary = boundary.where(boundary <= fu_end, fu_end)
 
     is_event = event.notna() & (event > entry) & (event <= boundary)
-    if LAG_DAYS > 0:
-        is_event &= (event - entry).dt.days >= LAG_DAYS
+    if core.LAG_DAYS > 0:
+        is_event &= (event - entry).dt.days >= core.LAG_DAYS
     if event_side == "pre":
         is_event &= event < OCT7
     elif event_side == "post":
@@ -577,8 +576,8 @@ def km_intervals(frame, downstream_outcome, group):
     fu_end = followup_end_for(entry.index)
     boundary = boundary.where(boundary <= fu_end, fu_end)
     is_event = event.notna() & (event > entry) & (event <= boundary)
-    if LAG_DAYS > 0:
-        is_event &= (event - entry).dt.days >= LAG_DAYS
+    if core.LAG_DAYS > 0:
+        is_event &= (event - entry).dt.days >= core.LAG_DAYS
     exit_date = boundary.where(~is_event, event)
 
     enter_date = entry.copy()
@@ -858,8 +857,8 @@ def comorbidity_segments(frame, outcome, x):
         ok = start.notna() & (end > start) & ~(O.notna() & (O <= start))
         start, end, o = start[ok], end[ok], O[ok]
         event = o.notna() & (o > start) & (o <= end)
-        if LAG_DAYS > 0:
-            event &= (o - start).dt.days >= LAG_DAYS
+        if core.LAG_DAYS > 0:
+            event &= (o - start).dt.days >= core.LAG_DAYS
         exit_ = end.where(~event, o)
         parts.append(pd.DataFrame({"state": state, "start": start,
                                    "py": member_days(start, exit_) / 365.25, "event": event}))
@@ -1270,8 +1269,8 @@ def exposed_followup_detail(entry_dates, event_dates, window_days=None):
     fu_end = followup_end_for(entry.index)
     boundary = pd.concat([window_end, pd.Series(STUDY_END, index=entry.index), fu_end], axis=1).min(axis=1)
     is_event = event.notna() & (event > entry) & (event <= boundary)
-    if LAG_DAYS > 0:
-        is_event &= (event - entry).dt.days >= LAG_DAYS
+    if core.LAG_DAYS > 0:
+        is_event &= (event - entry).dt.days >= core.LAG_DAYS
     end = boundary.where(~is_event, event)
 
     reason = np.select(

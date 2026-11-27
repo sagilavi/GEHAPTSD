@@ -1,9 +1,8 @@
 # C_IRR_Models.py -- LOGIC 3/4: adjusted IRR (Poisson regression, log person-years offset) and the
 # era comparisons (pre / post / crossing Oct 7).
 # Part of the pipeline run by C_ChangeInIRRByExposre.py (all files in the same directory):
-#   C_IRR_Core.py                  -- run settings (SLIM_RUN, SELECTED_TRAUMA_MODE, ...), run-time
-#                                     state, loading, membership / follow-up / person-time core,
-#                                     population variants
+#   C_IRR_Core.py                  -- run-time state, loading, membership / follow-up /
+#                                     person-time core, population variants
 #   C_IRR_Analyses.py              -- the computations behind Statements 1-7 and the descriptive PDF
 #   C_IRR_Models.py                -- adjusted IRR (Poisson) and the era comparisons
 #   C_IRR_Checks.py                -- automated sanity checks
@@ -12,8 +11,8 @@
 #   C_IRR_Graphs_Statements2to6.py -- graphs: Statements 2, 3, 5, 6 and comorbidity
 #   C_IRR_Graphs_Demog_Models.py   -- graphs: demographic / relative-year PDFs, adjusted IRR
 #                                     forests, era comparisons, section dividers, descriptive charts
-#   C_ChangeInIRRByExposre.py      -- MAIN: PDF assembly (export_all*), INPUT_FILE / OUTPUT_DIR,
-#                                     __main__
+#   C_ChangeInIRRByExposre.py      -- MAIN: USER SETTINGS (everything you edit), PDF assembly
+#                                     (export_all*), __main__
 # Run-time state (active window / trauma / diagnoser mode, follow-up end) lives in C_IRR_Core and
 # is always read as core.NAME outside it (the two print-once diagnostic flags: analyses.NAME),
 # so every module sees the current value.
@@ -32,7 +31,7 @@ warnings.filterwarnings("ignore")
 
 import C_IRR_Core as core   # run-time state -- read as core.NAME
 from C_IRR_Core import (  # noqa: F401
-    ALL_OUTCOMES, LAG_DAYS, OCT7, REGISTRY_START, STUDY_END, exposed_intervals, first_of,
+    ALL_OUTCOMES, OCT7, REGISTRY_START, STUDY_END, exposed_intervals, first_of,
     followup_end_for, general_intervals, member_days,
 )
 
@@ -368,8 +367,8 @@ def group_person_time(cohort, frame, outcome, group):
     at_risk = ~(event.notna() & (event <= OCT7))   # Y on/before Oct 7: not at risk of a first Y
     members, boundary, event = members[at_risk], boundary[at_risk], event[at_risk]
     is_event = event.notna() & (event <= boundary)
-    if LAG_DAYS > 0:
-        is_event &= (event - members["entry"]).dt.days >= LAG_DAYS
+    if core.LAG_DAYS > 0:
+        is_event &= (event - members["entry"]).dt.days >= core.LAG_DAYS
     end = boundary.where(~is_event, event)
     py = member_days(pd.Series(OCT7, index=end.index), end).clip(lower=0) / 365.25
     return members.drop(columns=["entry"]).assign(py=py, events=is_event.astype(int))

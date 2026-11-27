@@ -1,10 +1,10 @@
-# C_IRR_Core.py -- LOGIC 1/4: run settings, run-time state, loading and the person-time core.
-# Edit SLIM_RUN / SELECTED_TRAUMA_MODE here. set_window_mode() / set_trauma_mode() /
-# set_diagnoser_mode() / set_followup() change the state the other modules read as core.NAME.
+# C_IRR_Core.py -- LOGIC 1/4: run-time state, loading and the person-time core.
+# Nothing to edit here: the run settings are in the USER SETTINGS block of
+# C_ChangeInIRRByExposre.py. set_window_mode() / set_trauma_mode() / set_diagnoser_mode() /
+# set_followup() change the state the other modules read as core.NAME.
 # Part of the pipeline run by C_ChangeInIRRByExposre.py (all files in the same directory):
-#   C_IRR_Core.py                  -- run settings (SLIM_RUN, SELECTED_TRAUMA_MODE, ...), run-time
-#                                     state, loading, membership / follow-up / person-time core,
-#                                     population variants
+#   C_IRR_Core.py                  -- run-time state, loading, membership / follow-up /
+#                                     person-time core, population variants
 #   C_IRR_Analyses.py              -- the computations behind Statements 1-7 and the descriptive PDF
 #   C_IRR_Models.py                -- adjusted IRR (Poisson) and the era comparisons
 #   C_IRR_Checks.py                -- automated sanity checks
@@ -13,8 +13,8 @@
 #   C_IRR_Graphs_Statements2to6.py -- graphs: Statements 2, 3, 5, 6 and comorbidity
 #   C_IRR_Graphs_Demog_Models.py   -- graphs: demographic / relative-year PDFs, adjusted IRR
 #                                     forests, era comparisons, section dividers, descriptive charts
-#   C_ChangeInIRRByExposre.py      -- MAIN: PDF assembly (export_all*), INPUT_FILE / OUTPUT_DIR,
-#                                     __main__
+#   C_ChangeInIRRByExposre.py      -- MAIN: USER SETTINGS (everything you edit), PDF assembly
+#                                     (export_all*), __main__
 
 import os
 import io
@@ -72,18 +72,10 @@ CURRENT_DIAGNOSER_LABEL = DIAGNOSER_LABELS[CURRENT_DIAGNOSER_MODE]
 _current_outcome_profession_meta = None   # set by set_diagnoser_mode(); needed to look up who
                                           # diagnosed each outcome's earliest occurrence
 
-# --- CHOOSE WHICH TRAUMA MODE TO RUN (edit this, then re-run) --------------------------------
-# Unlike trauma mode (which auto-loops all 3 in export_all_trauma_modes()), diagnoser mode
-# ALWAYS loops all 3 automatically for whichever single trauma mode is selected here -- so one
-# run produces 2 age bands x 3 diagnoser modes = 6 files for this trauma mode. Change this and
-# re-run to get the other trauma mode's 6 files instead of generating all 18 at once.
-SELECTED_TRAUMA_MODE = "ptsd_asr"   # one of: "ptsd_asr", "ptsd_only", "asr_only"
-
-# --- SLIM_RUN: True -> write ONLY presentation_summary_age15_40_<trauma>_24mo_any_diagnoser.pdf
-# (one age band, one window, one diagnoser mode; no demographic / relative-year PDFs; sanity
-# checks still print to the console but no report file). False -> the full 12-file run.
-SLIM_RUN = True
-SLIM_AGE_BAND, SLIM_WINDOW, SLIM_DIAGNOSER = "age15_40", "24mo", "any_diagnoser"
+# --- Set from the USER SETTINGS block of C_ChangeInIRRByExposre.py when it starts -----------
+# Do not edit them here (main overwrites them); other modules read them as core.NAME.
+SELECTED_TRAUMA_MODE = None   # trauma mode used when a function is not given one
+LAG_DAYS = None               # protopathic-bias exclusion window, in days (0 = off)
 
 # --- Statement 1 & 2: exposure definitions -----------------------------------
 # 8 possible entry exposures (every outcome group can be an "entry" diagnosis). The trauma
@@ -252,16 +244,8 @@ def followup_end_for(index):
         return pd.Series(STUDY_END, index=index)
     return _followup_end.reindex(index)
 
-# --- LAG_DAYS: protopathic-bias exclusion window, OFF by default (0) -----------------------
-# If > 0, a downstream diagnosis occurring within LAG_DAYS of the entry diagnosis is NOT
-# counted as a "hit" -- the concern is that a diagnosis given days-to-weeks after entry may
-# reflect the SAME clinical episode being relabeled (e.g. an ASR diagnosis given in the chaos
-# right after Oct 7 that gets corrected to a psychosis diagnosis three weeks later isn't really
-# "trauma causing psychosis in 3 weeks" -- it's one episode, two labels), not a genuine delayed
-# effect. Left at 0 (no exclusion) until the latency histograms (Statement 6) show whether
-# there's actually a suspicious early spike that would justify a specific value -- kept as a
-# named, easy-to-set constant for exactly that follow-up, not implemented blindly now.
-LAG_DAYS = 0
+# LAG_DAYS (protopathic-bias exclusion window) is set in the USER SETTINGS block of
+# C_ChangeInIRRByExposre.py -- see the explanation there.
 
 # =============================================================================
 # PERSON-TIME CORE -- restricted (fixed-window) person-time, replacing binary cumulative risk
@@ -277,7 +261,7 @@ LAG_DAYS = 0
 # below say "per 1,000 person-years" and RR becomes IRR (incidence rate ratio).
 # =============================================================================
 
-def person_time_events_and_years(entry_dates, event_dates, window_days=None, lag_days=LAG_DAYS):
+def person_time_events_and_years(entry_dates, event_dates, window_days=None, lag_days=None):
     """For a cohort with `entry_dates` (index-aligned Series, NaT = not in this cohort) and
     `event_dates` (first occurrence of the outcome, NaT = never), returns (n_events,
     total_person_years) using a window capped at `window_days` (default: current
@@ -293,11 +277,12 @@ def person_time_events_and_years(entry_dates, event_dates, window_days=None, lag
     return n_events, person_years
 
 
-def exposed_intervals(entry_dates, event_dates, window_days=None, lag_days=LAG_DAYS):
+def exposed_intervals(entry_dates, event_dates, window_days=None, lag_days=None):
     """Per at-risk exposed patient: (entry, end_time, is_event, event) -- the at-risk interval
     behind person_time_events_and_years(); also used by the adjusted Poisson model so both
     count exactly the same person-time."""
     window_days = FIXED_WINDOW_DAYS if window_days is None else window_days
+    lag_days = LAG_DAYS if lag_days is None else lag_days
     valid = entry_dates.notna()
     entry = entry_dates[valid]
     event = event_dates.reindex(entry.index)
@@ -322,7 +307,7 @@ def exposed_intervals(entry_dates, event_dates, window_days=None, lag_days=LAG_D
     return entry, end_time, is_event, event
 
 
-def person_time_rate(entry_dates, event_dates, window_days=None, lag_days=LAG_DAYS):
+def person_time_rate(entry_dates, event_dates, window_days=None, lag_days=None):
     """Rate per 1,000 person-years -- wraps person_time_events_and_years()."""
     n_events, person_years = person_time_events_and_years(entry_dates, event_dates, window_days, lag_days)
     rate = (n_events / person_years * 1000) if person_years > 0 else np.nan
@@ -777,7 +762,7 @@ POPULATIONS = {
     "no7km_nonorth":   ("no 0-7 km from Gaza, no Northern Border (missing distance kept)", "_no7km_nonorth",
                         lambda f: ~(f["distance_km"] <= 7) & ~f["is_north_border"].astype(bool)),
 }
-EXTRA_POPULATIONS = ["gaza20km", "over20km_nonorth", "no7km_nonorth"]   # run for the SLIM combination only
+# which variants get their own extra PDF: EXTRA_POPULATIONS in the USER SETTINGS of main
 
 
 def apply_population(frame, entry_meta, downstream_meta, outcome_profession_meta, population_key):

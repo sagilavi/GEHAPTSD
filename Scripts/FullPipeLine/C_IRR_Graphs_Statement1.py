@@ -1,9 +1,8 @@
 # C_IRR_Graphs_Statement1.py -- GRAPHS 1/3: colors, and the chart panels and pages of
 # Statement 1 and its supporting tests (PART 1, 1B).
 # Part of the pipeline run by C_ChangeInIRRByExposre.py (all files in the same directory):
-#   C_IRR_Core.py                  -- run settings (SLIM_RUN, SELECTED_TRAUMA_MODE, ...), run-time
-#                                     state, loading, membership / follow-up / person-time core,
-#                                     population variants
+#   C_IRR_Core.py                  -- run-time state, loading, membership / follow-up /
+#                                     person-time core, population variants
 #   C_IRR_Analyses.py              -- the computations behind Statements 1-7 and the descriptive PDF
 #   C_IRR_Models.py                -- adjusted IRR (Poisson) and the era comparisons
 #   C_IRR_Checks.py                -- automated sanity checks
@@ -12,8 +11,8 @@
 #   C_IRR_Graphs_Statements2to6.py -- graphs: Statements 2, 3, 5, 6 and comorbidity
 #   C_IRR_Graphs_Demog_Models.py   -- graphs: demographic / relative-year PDFs, adjusted IRR
 #                                     forests, era comparisons, section dividers, descriptive charts
-#   C_ChangeInIRRByExposre.py      -- MAIN: PDF assembly (export_all*), INPUT_FILE / OUTPUT_DIR,
-#                                     __main__
+#   C_ChangeInIRRByExposre.py      -- MAIN: USER SETTINGS (everything you edit), PDF assembly
+#                                     (export_all*), __main__
 # Run-time state (active window / trauma / diagnoser mode, follow-up end) lives in C_IRR_Core and
 # is always read as core.NAME outside it (the two print-once diagnostic flags: analyses.NAME),
 # so every module sees the current value.
